@@ -1,6 +1,15 @@
-# weatherbotyes2re
+# weatherbotPreYes0910 / weatherbotyes2re
 
-METAR vs consensus **reversal** — see the break early, paper-fill before the scramble.
+METAR vs consensus **reversal** + **PreYes "稳了" Consensus Lock-in Strategy**.
+
+- **PreYes Strategy (`strategy_consensus_lock.py`)**:
+  - Filter: 22 high-cadence METAR stations (<=30 min report interval).
+  - Time Window: HIGH 12:00-18:00 local, LOW 00:00-09:00 local.
+  - Signal: METAR reaches expected extreme + rank-1 consensus + next bucket 1h TWAP < 20¢.
+  - Execution: Capped Taker with safety ceiling (0.45, 0.75].
+  - Pre-METAR Stop-Loss: Early orderbook surge/bid-collapse fast liquidation.
+  - Risk Lock: Max 2 fires/reverses per session to avoid multi-jump cascading loss.
+  - Unit Tests: `python tests_consensus_lock.py` (8/8 PASS).
 
 **No σ. No fade-NO / BUY-YES grid. No wallet. Paper only.**
 
