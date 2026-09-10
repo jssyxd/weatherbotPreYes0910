@@ -39,6 +39,25 @@ from paper_capital import close_leg_at_best_bid, reserve
 from research import common
 from reversal_strategy import ensure_re_state, maybe_arm_or_fire, prune_stale_sessions
 from ws_bridge import ws_bridge
+from strategy_consensus_lock import (
+    ConsensusLockStrategy,
+    PositionRecord,
+    FAST_METAR_CITIES,
+    find_bucket,
+    ordered_buckets,
+    mid_value,
+    get_best_bid,
+    get_best_ask,
+)
+
+_CONSENSUS_LOCK_STRAT: ConsensusLockStrategy | None = None
+
+def _get_consensus_lock_strat(cfg: dict[str, Any]) -> ConsensusLockStrategy:
+    global _CONSENSUS_LOCK_STRAT
+    if _CONSENSUS_LOCK_STRAT is None:
+        merged_cfg = {**(cfg.get("strategy") or {}), **(cfg.get("consensus_lock") or {})}
+        _CONSENSUS_LOCK_STRAT = ConsensusLockStrategy(merged_cfg)
+    return _CONSENSUS_LOCK_STRAT
 
 # B2 pre-breach sleeve: process-lifetime price ring + per-key entered set so a
 # session only sleeves once (dedupe against the WS book ticking every cycle).
@@ -897,7 +916,7 @@ def _paper_fire(
 
     position = {
         "key": fire["key"],
-        "kind": "sleeve" if is_sleeve else "reversal",
+        "kind": fire.get("kind") or ("sleeve" if is_sleeve else "reversal"),
         "city_id": fire.get("city_id"),
         "icao": fire.get("icao"),
         "market_local_date": fire.get("market_local_date"),
@@ -929,23 +948,26 @@ def _paper_fire(
             "cost_usdc": str(fl["cost"]),
             "shares": str(fl["shares"]),
             "avg_price": fl["fill_price"],
-            "bucket_id": None,
+            "bucket_id": leg.get("bucket_id"),
             "bucket_lo": leg.get("bucket_lo"),
             "bucket_hi": leg.get("bucket_hi"),
             "bucket_label": leg.get("bucket_label"),
             "settled": False,
             "leg_won": None,
         }
-    # attach bucket_id by matching back through the fire leg spec (broken_no/new_yes)
+    # attach bucket_id by matching back through the fire leg spec (broken_no/new_yes/lock_yes)
     for leg in fire.get("legs", []):
         name = str(leg["leg"])
         if name == "buy_no_broken":
             bucket_id = fire.get("broken_bucket_id")
         elif name in ("buy_yes_new", "buy_yes_sleeve"):
             bucket_id = fire.get("new_bucket_id")
+        elif name == "buy_yes_lock":
+            bucket_id = fire.get("target_bucket_id") or leg.get("bucket_id")
         else:
-            continue
-        pos_legs_by_name[name]["bucket_id"] = bucket_id
+            bucket_id = leg.get("bucket_id")
+        if bucket_id is not None:
+            pos_legs_by_name[name]["bucket_id"] = bucket_id
     position["legs"] = list(pos_legs_by_name.values())
 
     return position, ladlog
@@ -1416,6 +1438,49 @@ def run_cycle(
             # False), so a dead-date session can never reserve sleeve cash.
             if srule and _rule_is_local_today(rule, city_by_id, now):
                 _sleeve_tick(cfg, state, rule, rule_books, tree, now)
+
+        # ---- Pre-METAR early stop loss (book-surge / bid-collapse fast defense) ----
+        if cfg.get("strategy_mode") == "consensus_lock" and rule_books:
+            strat = _get_consensus_lock_strat(cfg)
+            rule_key = f"{rule.get('city_id')}|{rule.get('market_local_date')}|{rule.get('direction')}"
+            pos = (state.get("positions") or {}).get(rule_key)
+            if pos and not pos.get("settled") and not pos.get("liquidated"):
+                for l in pos.get("legs", []):
+                    if l.get("outcome") == "YES" and Decimal(str(l.get("shares") or 0)) > ZERO:
+                        strat.state.open_positions[rule_key] = PositionRecord(
+                            session_key=rule_key,
+                            bucket_id=str(l.get("bucket_id") or ""),
+                            yes_token_id=str(l.get("token_id") or ""),
+                            shares=Decimal(str(l.get("shares"))),
+                            cost_usdc=Decimal(str(l.get("cost_usdc"))),
+                            avg_price=Decimal(str(l.get("avg_price") or 0)),
+                            entry_ts_utc=pos.get("fires_at_utc", ""),
+                            liquidated=False,
+                        )
+                early_stop = strat.evaluate_early_stop_loss(
+                    rule_key, rule.get("direction"), rule.get("buckets", []), rule_books, now
+                )
+                if early_stop:
+                    liq_res = {}
+                    for leg in pos.get("legs", []):
+                        if leg.get("outcome") == "YES" and not leg.get("settled"):
+                            res = close_leg_at_best_bid(
+                                state, leg, rule_books,
+                                closed_by="early_stop_loss",
+                                settled_at_utc=re_execution.iso_utc(now),
+                            )
+                            liq_res[leg.get("token_id")] = res
+                    pos["settled"] = True
+                    pos["liquidated"] = True
+                    pos["liquidation_type"] = early_stop.get("reason")
+                    log_event(log_path, {
+                        "type": "early_stop_loss",
+                        "key": rule_key,
+                        "reason": early_stop.get("reason"),
+                        "liquidation": liq_res,
+                        "ts_utc": re_execution.iso_utc(now),
+                    })
+
         icao = city_by_id.get(rule.get("city_id"), {}).get("icao", "").upper()
         obs = metar_by_icao.get(icao)
         if obs is None or obs.get("temp_c") is None:
@@ -1448,6 +1513,145 @@ def run_cycle(
                         taf_extreme_market = common.c_to_market_unit(float(taf_c), market_unit)
                 except Exception:  # noqa: BLE001 — bad TAF metadata → None → consensus fallback
                     taf_extreme_market = None
+
+        # ---- Branch for PreYes consensus lock strategy ----
+        if cfg.get("strategy_mode") == "consensus_lock":
+            strat = _get_consensus_lock_strat(cfg)
+            rule_key = f"{city['city_id']}|{rule.get('market_local_date')}|{rule.get('direction')}"
+
+            # 1. 站点频次筛选 (只做 <=30min 高频发布 METAR 站点)
+            if not strat.is_fast_station(city["city_id"]):
+                log_event(log_path, {"type": "skip", "key": rule_key, "reason": "infrequent_metar_station"})
+                continue
+
+            pos = (state.get("positions") or {}).get(rule_key)
+            if pos and not pos.get("settled") and not pos.get("liquidated"):
+                # Session has active open position -> check for METAR hard breach!
+                breach = strat.handle_breach_risk_control(
+                    rule_key, city, rule.get("direction"), rule_buckets, temp, rule_books, now
+                )
+                if breach:
+                    # Hard breach occurred! Liquidate old YES if not yet settled
+                    for leg in pos.get("legs", []):
+                        if leg.get("outcome") == "YES" and not leg.get("settled"):
+                            close_leg_at_best_bid(
+                                state, leg, rule_books,
+                                closed_by="metar_breach",
+                                settled_at_utc=re_execution.iso_utc(now)
+                            )
+                    pos["settled"] = True
+                    pos["liquidated"] = True
+                    pos["liquidation_type"] = "METAR_BREACH"
+                    log_event(log_path, {
+                        "type": "breach_risk_control",
+                        "key": rule_key,
+                        "breach_temp": temp,
+                        "breach_info": breach,
+                    })
+
+                    # If reverse hedge legs generated, execute 追火 / 反手
+                    hedge_legs = breach.get("hedge_legs", [])
+                    if hedge_legs:
+                        hedge_fire = {
+                            "key": rule_key,
+                            "kind": "consensus_lock",
+                            "city_id": city["city_id"],
+                            "icao": city.get("icao"),
+                            "market_local_date": rule.get("market_local_date"),
+                            "direction": rule.get("direction"),
+                            "ref_extreme": float(taf_extreme_market if taf_extreme_market is not None else temp),
+                            "ref_source": "metar_breach_hedge",
+                            "running_extreme": temp,
+                            "jump": 1,
+                            "broken_bucket_id": breach.get("orig_bucket_id"),
+                            "new_bucket_id": breach.get("new_bucket_id"),
+                            "local_fire_time": now.astimezone(ZoneInfo(city.get("timezone", "UTC"))).isoformat(),
+                            "market_unit": market_unit,
+                            "fire_no": breach.get("fire_no", 2),
+                            "budget_usdc": str(cfg.get("fire_budget_usdc", 15.0)),
+                            "legs": hedge_legs,
+                            "action_type": "re_fire",
+                        }
+                        log_event(log_path, {
+                            "type": "fire_attempt",
+                            "key": rule_key,
+                            "fire_no": hedge_fire["fire_no"],
+                            "ref_source": hedge_fire["ref_source"],
+                        })
+                        new_pos, ladlog = _paper_fire(cfg, state, hedge_fire, now)
+                        if new_pos is not None:
+                            record_refire(cfg, state, hedge_fire, new_pos, ladlog, now)
+                continue
+
+            # No open position for this session -> evaluate entry
+            expected_ref = taf_extreme_market
+            if expected_ref is None:
+                ranked = t.rank_buckets(
+                    city["city_id"], rule.get("market_local_date"), rule.get("direction"),
+                    now_utc=now, window_seconds=strat.cfg.get("next_bucket_twap_window_s", 3600)
+                )
+                if ranked:
+                    top_bid = ranked[0][0]
+                    for bk in rule_buckets:
+                        if str(bk.get("bucket_id") or bk.get("id") or "") == str(top_bid):
+                            expected_ref = mid_value(bk)
+                            break
+
+            entry_res = strat.evaluate_entry(
+                city, rule.get("market_local_date"), rule.get("direction"),
+                rule_buckets, expected_ref, obs, rule_books, t, now
+            )
+            if entry_res.get("action") == "execute_taker_fire":
+                fire_action = {
+                    "key": rule_key,
+                    "kind": "consensus_lock",
+                    "city_id": city["city_id"],
+                    "icao": city.get("icao"),
+                    "market_local_date": rule.get("market_local_date"),
+                    "direction": rule.get("direction"),
+                    "ref_extreme": float(expected_ref if expected_ref is not None else temp),
+                    "ref_source": "taf" if taf_extreme_market is not None else "market_rank1",
+                    "running_extreme": temp,
+                    "jump": 0,
+                    "target_bucket_id": entry_res["bucket_id"],
+                    "local_fire_time": now.astimezone(ZoneInfo(city.get("timezone", "UTC"))).isoformat(),
+                    "market_unit": market_unit,
+                    "fire_no": 1,
+                    "budget_usdc": str(cfg.get("fire_budget_usdc", 15.0)),
+                    "legs": [
+                        {
+                            "leg": "buy_yes_lock",
+                            "token_id": entry_res["token_id"],
+                            "side": "BUY",
+                            "outcome": "YES",
+                            "cap": str(entry_res.get("cap", "0.75")),
+                            "floor": str(strat.cfg.get("yes_min_ask", "0.45")),
+                            "notional_pct": "1.0",
+                            "bucket_id": entry_res["bucket_id"],
+                        }
+                    ],
+                    "action_type": "re_fire",
+                }
+                log_event(log_path, {
+                    "type": "fire_attempt",
+                    "key": rule_key,
+                    "fire_no": 1,
+                    "ref_source": fire_action["ref_source"],
+                    "consensus_meta": entry_res.get("consensus_meta"),
+                })
+                pos_rec, ladlog = _paper_fire(cfg, state, fire_action, now)
+                if pos_rec is not None:
+                    _record_fire_event(cfg, state, fire_action, pos_rec, ladlog, now)
+                else:
+                    rec = tree.setdefault("fired", {}).setdefault(rule_key, {})
+                    rec["status"] = "fired_no_fill"
+                    rec["at_utc"] = re_execution.iso_utc(now)
+            else:
+                reason = entry_res.get("reason", "unknown_skip")
+                if reason != "duplicate_obs_time":
+                    log_event(log_path, {"type": "skip", "key": rule_key, "reason": reason})
+            continue
+
         # pass all known books for the whole rule (only YES needed for consensus)
         actions = maybe_arm_or_fire(
             state,
