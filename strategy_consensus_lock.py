@@ -1,4 +1,4 @@
-﻿"""strategy_consensus_lock.py — 优化版"稳了"共识锁定策略与前置异动极速风控引擎 (V2 生产级)
+"""strategy_consensus_lock.py — 优化版"稳了"共识锁定策略与前置异动极速风控引擎 (V2 生产级)
 
 基于实盘微观结构三大优化落地：
 1. 【执行优化 - Capped Taker / 价格门控吃单】:
@@ -64,12 +64,12 @@ DEFAULT_CONFIG = {
     "low_local_start": 0,
     "low_local_end": 9,
     # 稳了门槛
-    "next_bucket_max_twap": Decimal("0.20"),          # 下一档 1h TWAP 阈值 (< 0.20)
+    "next_bucket_max_twap": Decimal("0.26"),          # 下一档 1h TWAP 阈值 (< 0.26，捕获如新加坡等胜率盘)
     "next_bucket_twap_window_s": 3600,                 # 1小时窗口
     # 执行模式: "capped_taker" (推荐) 或 "best_bid_peg"
     "entry_mode": "capped_taker",
     "yes_min_ask": Decimal("0.45"),                   # YES 必须确认一定胜率 (>0.45)
-    "yes_max_ask": Decimal("0.75"),                   # YES 安全入场顶价，绝不追高 (>0.75 放弃)
+    "yes_max_ask": Decimal("0.80"),                   # YES 安全入场顶价，适度放宽至 0.80，绝不追超高 (>0.80 放弃)
     "order_budget_usdc": Decimal("15.0"),              # 每次开仓 15 USDC
     "mid_discount": Decimal("0.90"),                   # 仅在 peg 模式下使用的折价
     "resting_order_timeout_s": 180,                    # peg 模式下挂单最长 3 分钟
