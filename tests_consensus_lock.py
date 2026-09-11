@@ -1,9 +1,9 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """tests_consensus_lock.py — 针对优化版策略的完整测试套件 (8大微观结构场景全覆盖)"""
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
 from consensus_tracker import ConsensusTracker
@@ -238,6 +238,124 @@ def test_max_fires_cap_enforcement():
     print("PASS: 8. test_max_fires_cap_enforcement")
 
 
+def test_post_stop_loss_cooldown():
+    """防线 1: 验证止损后单向熔断冷却，彻底杜绝赫尔辛基式同一分钟连续开仓。"""
+    strat = ConsensusLockStrategy({"early_stop_next_bucket_surge": Decimal("0.35")})
+    city = make_city("helsinki", tz="Europe/Helsinki", icao="EFHK")
+    bks = make_buckets()
+    key = "helsinki|2026-09-10|high"
+    now_utc = datetime(2026, 9, 10, 12, 40, 27, tzinfo=timezone.utc)
+
+    # 1. 模拟初次开仓并持仓
+    strat.state.open_positions[key] = PositionRecord(
+        session_key=key, bucket_id="b31", yes_token_id="Y31",
+        shares=Decimal("18.75"), cost_usdc=Decimal("14.43"), avg_price=Decimal("0.77"),
+        entry_ts_utc=now_utc.isoformat(),
+    )
+    strat.state.session_fires_count[key] = 1
+
+    # 2. 下一档暴涨至 0.49 触发提前止损
+    books_surge = {
+        "Y31": {"best_bid": "0.50", "best_ask": "0.60"},
+        "Y32": {"best_bid": "0.45", "best_ask": "0.49"},
+    }
+    stop_res = strat.evaluate_early_stop_loss(key, "high", bks, books_surge, now_utc)
+    assert stop_res is not None
+    assert key in strat.state.stopped_out_sessions
+    assert key in strat.state.breached_sessions
+
+    # 3. 验证紧接着的下一个 tick 即使 session_fires_count=1 < max_fires=2，也坚决拒绝二次入场！
+    tracker = ConsensusTracker()
+    tracker.record_books("helsinki", "2026-09-10", "high", bks, books_surge, now_utc)
+    obs = {"temp_c": 31.0, "obs_age_s": 0}
+    entry_res = strat.evaluate_entry(city, "2026-09-10", "high", bks, 31.0, obs, books_surge, tracker, now_utc)
+    assert entry_res["action"] == "skip"
+    assert entry_res["reason"] == "session_already_stopped_out"
+    print("PASS: 9. test_post_stop_loss_cooldown (止损后单向熔断成功阻断二次入场)")
+
+
+def test_temperature_velocity_stalling_filter():
+    """防线 2: 验证气温变化率停滞过滤器 (冲顶动量拦截与见顶企稳放行)。"""
+    strat = ConsensusLockStrategy({"min_dwell_seconds_if_rising": 1800})
+    city = make_city("helsinki", tz="Europe/Helsinki", icao="EFHK")
+    bks = make_buckets()
+    date_str = "2026-09-10"
+    dir_str = "high"
+    t0 = datetime(2026, 9, 10, 12, 10, 0, tzinfo=timezone.utc)
+
+    tracker = ConsensusTracker()
+    books = {
+        "Y31": {"best_bid": "0.65", "best_ask": "0.70"},
+        "Y32": {"best_bid": "0.05", "best_ask": "0.10"},
+    }
+    tracker.record_books("helsinki", date_str, dir_str, bks, books, t0)
+
+    # 步骤 1: 上一份报文为 30.0 度
+    obs1 = {"temp_c": 30.0, "obs_age_s": 600}
+    res1 = strat.evaluate_entry(city, date_str, dir_str, bks, 31.0, obs1, books, tracker, t0)
+    assert res1["action"] == "skip"
+    assert "not_reached_expected_high" in res1["reason"]
+
+    # 步骤 2: 下一份报文跳升到 31.0 度 (刚跳字，升温斜率冲顶，停留仅 60 秒)
+    t1 = t0 + timedelta(minutes=10)
+    obs2 = {"temp_c": 31.0, "obs_age_s": 60}
+    res2 = strat.evaluate_entry(city, date_str, dir_str, bks, 31.0, obs2, books, tracker, t1)
+    assert res2["action"] == "skip"
+    assert "temperature_rising_velocity_active" in res2["reason"]
+    print("PASS: 10a. test_temperature_velocity_stalling_filter (刚跳升未停滞成功拦截)")
+
+    # 步骤 3: 维持该温度超过 1800 秒 (见顶企稳，斜率归零)
+    t2 = t1 + timedelta(seconds=1900)
+    obs3 = {"temp_c": 31.0, "obs_age_s": 1900}
+    res3 = strat.evaluate_entry(city, date_str, dir_str, bks, 31.0, obs3, books, tracker, t2)
+    assert res3["action"] == "execute_taker_fire"
+    print("PASS: 10b. test_temperature_velocity_stalling_filter (充分停滞后正常放行开仓)")
+
+
+def test_next_bucket_instantaneous_book_checks():
+    """防线 3: 验证下一档瞬时盘口与买单防御 (防范快钱突袭与 TWAP 滞后)。"""
+    strat = ConsensusLockStrategy({
+        "next_bucket_max_twap": Decimal("0.26"),
+        "next_bucket_max_instant_ask": Decimal("0.25"),
+        "next_bucket_max_instant_bid": Decimal("0.15"),
+    })
+    city = make_city("tokyo", tz="Asia/Tokyo", icao="RJTT")
+    bks = make_buckets()
+    date_str = "2026-09-10"
+    dir_str = "high"
+    now_utc = datetime(2026, 9, 10, 5, 0, 0, tzinfo=timezone.utc)
+
+    # 过去 1 小时 TWAP 看起来很低 (0.15 < 0.26)
+    tracker = ConsensusTracker()
+    for t_step in range(10):
+        t_sample = datetime(2026, 9, 10, 4, 10 + t_step, 0, tzinfo=timezone.utc)
+        books_sample = {
+            "Y31": {"best_bid": "0.65", "best_ask": "0.70"},
+            "Y32": {"best_bid": "0.10", "best_ask": "0.15"},
+        }
+        tracker.record_books("tokyo", date_str, dir_str, bks, books_sample, t_sample)
+
+    # 场景 A: 瞬时 Ask 突增至 0.28 (>= 0.25)
+    books_instant_ask_high = {
+        "Y31": {"best_bid": "0.65", "best_ask": "0.70"},
+        "Y32": {"best_bid": "0.10", "best_ask": "0.28"},
+    }
+    obs = {"temp_c": 31.0, "obs_age_s": 2000}
+    res_a = strat.evaluate_entry(city, date_str, dir_str, bks, 31.0, obs, books_instant_ask_high, tracker, now_utc)
+    assert res_a["action"] == "skip"
+    assert "next_bucket_instant_ask_too_high" in res_a["reason"]
+
+    # 场景 B: 瞬时 Bid 潜伏至 0.18 (>= 0.15)
+    books_instant_bid_high = {
+        "Y31": {"best_bid": "0.65", "best_ask": "0.70"},
+        "Y32": {"best_bid": "0.18", "best_ask": "0.22"},
+    }
+    res_b = strat.evaluate_entry(city, date_str, dir_str, bks, 31.0, obs, books_instant_bid_high, tracker, now_utc)
+    assert res_b["action"] == "skip"
+    assert "next_bucket_instant_bid_too_high" in res_b["reason"]
+    print("PASS: 11. test_next_bucket_instantaneous_book_checks (瞬时盘口双向校验生效)")
+
+
 def main():
     test_station_filter()
     test_time_window()
@@ -247,7 +365,10 @@ def main():
     test_pre_metar_early_stop_bid_floor()
     test_breach_risk_control_and_no_defence()
     test_max_fires_cap_enforcement()
-    print("\nALL 8 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
+    test_post_stop_loss_cooldown()
+    test_temperature_velocity_stalling_filter()
+    test_next_bucket_instantaneous_book_checks()
+    print("\nALL 11 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

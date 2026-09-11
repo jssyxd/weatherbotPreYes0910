@@ -1444,7 +1444,10 @@ def run_cycle(
             strat = _get_consensus_lock_strat(cfg)
             rule_key = f"{rule.get('city_id')}|{rule.get('market_local_date')}|{rule.get('direction')}"
             pos = (state.get("positions") or {}).get(rule_key)
-            if pos and not pos.get("settled") and not pos.get("liquidated"):
+            if pos and (pos.get("settled") or pos.get("liquidated")):
+                strat.state.stopped_out_sessions.add(rule_key)
+                strat.state.breached_sessions.add(rule_key)
+            elif pos and not pos.get("settled") and not pos.get("liquidated"):
                 for l in pos.get("legs", []):
                     if l.get("outcome") == "YES" and Decimal(str(l.get("shares") or 0)) > ZERO:
                         strat.state.open_positions[rule_key] = PositionRecord(
@@ -1473,6 +1476,8 @@ def run_cycle(
                     pos["settled"] = True
                     pos["liquidated"] = True
                     pos["liquidation_type"] = early_stop.get("reason")
+                    strat.state.stopped_out_sessions.add(rule_key)
+                    strat.state.breached_sessions.add(rule_key)
                     log_event(log_path, {
                         "type": "early_stop_loss",
                         "key": rule_key,

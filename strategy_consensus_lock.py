@@ -59,13 +59,16 @@ FAST_METAR_CITIES: set[str] = {
 # 优化后生产配置
 DEFAULT_CONFIG = {
     "filter_fast_stations_only": True,
-    "high_local_start": 12,
+    "high_local_start": 14,                           # 避开正午强对流与急剧升温期 (14:00~18:00)
     "high_local_end": 18,
     "low_local_start": 0,
     "low_local_end": 9,
     # 稳了门槛
     "next_bucket_max_twap": Decimal("0.26"),          # 下一档 1h TWAP 阈值 (< 0.26，捕获如新加坡等胜率盘)
     "next_bucket_twap_window_s": 3600,                 # 1小时窗口
+    "next_bucket_max_instant_ask": Decimal("0.25"),    # 下一档瞬时 Ask 必须 < 0.25 (防快钱突袭)
+    "next_bucket_max_instant_bid": Decimal("0.15"),    # 下一档瞬时 Bid 必须 < 0.15 (防多头潜伏)
+    "min_dwell_seconds_if_rising": 1800,               # 升温跃升后必须在该温度停滞至少 30 分钟方可开仓
     # 执行模式: "capped_taker" (推荐) 或 "best_bid_peg"
     "entry_mode": "capped_taker",
     "yes_min_ask": Decimal("0.45"),                   # YES 必须确认一定胜率 (>0.45)
@@ -78,7 +81,7 @@ DEFAULT_CONFIG = {
     "early_stop_next_bucket_surge": Decimal("0.35"),  # 下一档暴涨至 0.35 触发抢跑止损
     "early_stop_bid_floor": Decimal("0.45"),          # 当前持仓 YES 盘口跌破 0.45 触发抢跑止损
     # 破位与追火约束
-    "max_fires_per_session": 2,                       # 单日同一标的最多 2 次 (初次 + 1次追火)
+    "max_fires_per_session": 2,                       # 单日同一标的最多 2 次 (初次 + 1次追火，止损后熔断阻断)
     "risk_control_no_cap": Decimal("0.85"),           # 破位 NO 腿超过 0.85 坚决不买 (防扫空)
     "risk_control_yes_cap": Decimal("0.75"),          # 新 YES 腿同样限顶价 0.75
 }
@@ -206,12 +209,14 @@ class ConsensusLockState:
     locked_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     session_fires_count: dict[str, int] = field(default_factory=dict)  # session_key -> int
     breached_sessions: set[str] = field(default_factory=set)
+    stopped_out_sessions: set[str] = field(default_factory=set)        # 触发提前止损熔断标的
 
 
 class ConsensusLockStrategy:
     def __init__(self, cfg: dict[str, Any] | None = None):
         self.cfg = {**DEFAULT_CONFIG, **(cfg or {})}
         self.state = ConsensusLockState()
+        self._metar_history: dict[str, list[dict[str, Any]]] = {}      # session_key -> [{"temp": float, "obs_time": float, "recorded_at": float}]
 
     def is_fast_station(self, city_id: str) -> bool:
         if not self.cfg.get("filter_fast_stations_only", True):
@@ -243,8 +248,9 @@ class ConsensusLockStrategy:
         target_bk: dict[str, Any],
         tracker: ConsensusTracker,
         now_utc: datetime,
+        books_by_token: dict[str, Any] | None = None,
     ) -> tuple[bool, str, dict[str, Any]]:
-        """检查 target_bk 是否为共识第一 (Rank-1) 且下一档可能破位的桶稳定 < 20¢。"""
+        """检查 target_bk 是否为共识第一 (Rank-1) 且下一档可能破位的桶稳定 < 26¢ 且瞬时盘口未异动。"""
         meta: dict[str, Any] = {}
         ranked = tracker.rank_buckets(
             city_id, market_local_date, direction,
@@ -279,9 +285,27 @@ class ConsensusLockStrategy:
             meta["next_bucket_id"] = next_id
             meta["next_bucket_twap"] = str(next_twap) if next_twap is not None else "none"
 
-            max_allowed = _dec(self.cfg["next_bucket_max_twap"], "0.20")
+            max_allowed = _dec(self.cfg["next_bucket_max_twap"], "0.26")
             if next_twap is not None and next_twap >= max_allowed:
                 return False, f"next_bucket_twap_too_high ({next_twap} >= {max_allowed})", meta
+
+            # 防线 3: 下一档瞬时盘口校验 (弥补 1h TWAP 滞后性)
+            next_yes_tok = next_bk.get("yes_token_id") or next_bk.get("_yes_token_id")
+            if next_yes_tok and books_by_token:
+                next_book = books_by_token.get(str(next_yes_tok))
+                if next_book:
+                    next_ask = get_best_ask(next_book)
+                    next_bid = get_best_bid(next_book)
+                    meta["next_bucket_instant_ask"] = str(next_ask) if next_ask is not None else "none"
+                    meta["next_bucket_instant_bid"] = str(next_bid) if next_bid is not None else "none"
+
+                    max_instant_ask = _dec(self.cfg.get("next_bucket_max_instant_ask", "0.25"), "0.25")
+                    if next_ask is not None and next_ask >= max_instant_ask:
+                        return False, f"next_bucket_instant_ask_too_high ({next_ask} >= {max_instant_ask})", meta
+
+                    max_instant_bid = _dec(self.cfg.get("next_bucket_max_instant_bid", "0.15"), "0.15")
+                    if next_bid is not None and next_bid >= max_instant_bid:
+                        return False, f"next_bucket_instant_bid_too_high ({next_bid} >= {max_instant_bid})", meta
         else:
             meta["next_bucket_id"] = "boundary_terminal"
             meta["next_bucket_twap"] = "0"
@@ -308,16 +332,18 @@ class ConsensusLockStrategy:
         if not self.is_fast_station(city_id):
             return {"action": "skip", "reason": "infrequent_metar_station", "key": key}
 
-        # 2. 检查单日追火/开仓次数上限 (严格限制 <= 2)
-        cur_fires = self.state.session_fires_count.get(key, 0)
-        max_fires = int(self.cfg.get("max_fires_per_session", 2))
-        if cur_fires >= max_fires:
-            return {"action": "skip", "reason": f"session_max_fires_reached ({cur_fires}>={max_fires})", "key": key}
-
+        # 2. 检查单日追火/开仓次数上限与熔断
+        if key in self.state.stopped_out_sessions:
+            return {"action": "skip", "reason": "session_already_stopped_out", "key": key}
         if key in self.state.breached_sessions:
             return {"action": "skip", "reason": "session_already_breached", "key": key}
         if key in self.state.open_positions and not self.state.open_positions[key].liquidated:
             return {"action": "skip", "reason": "session_already_has_open_position", "key": key}
+
+        cur_fires = self.state.session_fires_count.get(key, 0)
+        max_fires = int(self.cfg.get("max_fires_per_session", 2))
+        if cur_fires >= max_fires:
+            return {"action": "skip", "reason": f"session_max_fires_reached ({cur_fires}>={max_fires})", "key": key}
 
         # 3. 时间窗口检查
         in_win, loc_hr = self.is_in_time_window(now_utc, city.get("timezone", "UTC"), direction)
@@ -332,6 +358,36 @@ class ConsensusLockStrategy:
         if expected_extreme_temp is None:
             return {"action": "skip", "reason": "no_expected_extreme_reference", "key": key}
 
+        # 防线 2: 气温变率停滞检查 (dT/dt <= 0 & Dwell Time 确认，防冲顶接飞刀)
+        obs_age = float(metar_obs.get("obs_age_s") or 0.0)
+        obs_time = now_utc.timestamp() - obs_age
+        hist = self._metar_history.setdefault(key, [])
+        now_ts = now_utc.timestamp()
+        if not hist or abs(obs_time - hist[-1].get("obs_time", 0.0)) >= 300 or hist[-1].get("temp") != curr_temp:
+            hist.append({"temp": curr_temp, "obs_time": obs_time, "recorded_at": now_ts})
+            if len(hist) > 10:
+                hist.pop(0)
+
+        dir_norm = direction.lower()
+        min_dwell_s = float(self.cfg.get("min_dwell_seconds_if_rising", 1800))
+        if len(hist) >= 2:
+            prev_temp = hist[-2]["temp"]
+            dwell_s = now_ts - hist[-1]["recorded_at"]
+            if dir_norm == "high":
+                if curr_temp > prev_temp and dwell_s < min_dwell_s:
+                    return {
+                        "action": "skip",
+                        "reason": f"temperature_rising_velocity_active (jumped {prev_temp}C -> {curr_temp}C, dwell {int(dwell_s)}s < {int(min_dwell_s)}s)",
+                        "key": key,
+                    }
+            else:
+                if curr_temp < prev_temp and dwell_s < min_dwell_s:
+                    return {
+                        "action": "skip",
+                        "reason": f"temperature_falling_velocity_active (dropped {prev_temp}C -> {curr_temp}C, dwell {int(dwell_s)}s < {int(min_dwell_s)}s)",
+                        "key": key,
+                    }
+
         # 5. 是否站上预计极值桶
         curr_bucket = find_bucket(buckets, curr_temp)
         target_bucket = find_bucket(buckets, float(expected_extreme_temp))
@@ -344,7 +400,6 @@ class ConsensusLockStrategy:
         c_idx = ordered.index(curr_bucket)
         t_idx = ordered.index(target_bucket)
 
-        dir_norm = direction.lower()
         if dir_norm == "high":
             if c_idx < t_idx:
                 return {"action": "skip", "reason": f"not_reached_expected_high ({curr_temp} < expected {expected_extreme_temp})", "key": key}
@@ -356,9 +411,9 @@ class ConsensusLockStrategy:
             elif c_idx < t_idx:
                 return {"action": "skip", "reason": f"already_exceeded_expected_low ({curr_temp} < expected {expected_extreme_temp})", "key": key}
 
-        # 6. 检查共识第一 + 下一档桶过去 1h 价格稳定 < 20¢
+        # 6. 检查共识第一 + 下一档桶价格与瞬时盘口 (防线 3: 瞬时盘口校验)
         ok_cons, reason_cons, meta_cons = self.check_consensus_and_next_bucket(
-            city_id, market_local_date, direction, ordered, target_bucket, tracker, now_utc
+            city_id, market_local_date, direction, ordered, target_bucket, tracker, now_utc, books_by_token
         )
         if not ok_cons:
             return {"action": "skip", "reason": f"consensus_check_failed: {reason_cons}", "meta": meta_cons, "key": key}
@@ -536,6 +591,10 @@ class ConsensusLockStrategy:
         pos.liquidation_type = trigger_reason
         pos.recovered_usdc = recovered_usdc
         pos.realized_pnl_usdc = -loss_usdc
+
+        # 防线 1: 止损后单向熔断，当日禁止再次对该标的开仓！
+        self.state.stopped_out_sessions.add(session_key)
+        self.state.breached_sessions.add(session_key)
 
         # 撤销所有本 session 未成交挂单
         for ord_item in self.state.active_orders.values():
