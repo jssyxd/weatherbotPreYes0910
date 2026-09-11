@@ -1,6 +1,45 @@
-# Changelog — weatherbotyes2re
+# Changelog — weatherbotPreYes0910
 
-## 2026-09-08 — Fire-window intervalization (HIGH 13-17 / LOW 1-9 local)
+## 2026-09-12 — 激进吃单 (FAK Taker) 精度修复 + Nautilus Trader v2.0 规范对齐 + 全量 142 单测通过
+
+- **激进吃单 (FAK Taker) 生产精度对齐 (`live/v2_transport.py`)**：
+  - 同步 Nautilus Trader v2.0 Polymarket 官方适配器规范与 Polymarket CLOB v2 最新限额：
+    - `OrderType.FAK` 市场买单 (`BUY`) 的 `maker_amount`（USDC 名义金额）严格保留 2 位小数（`Decimal('0.01')`，向下取整）。
+    - 市场卖单 (`SELL`) 的数量严格保留 4 位小数（`Decimal('0.0001')`，向下取整）。
+    - 彻底修复 `400 invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals` 报错。
+  - **FAK 无对手盘静默撤单**：捕获 `400 "no orders found to match with FAK"` 响应并作为 0-fill 正常结算，消除残留风险虚假报警。
+  - **腿级独立决策与严格放弃 (Take-or-Nothing)**：YES 腿在价格区间 `(0.45, 0.75]` 内执行 FAK 吃单，区间外严格放弃（`status="skip"`），**绝对不降级为被动挂单 (never passive fallback)**；NO 腿独立依据自身盘口 ask <= cap 决定是否吃单。
+- **PreYes 稳了参数基线与回归测试套件全面对齐 (`tests_port.py`, `tests_live.py`)**：
+  - 更新 `tests_port.py` 的基准黄金配置与策略期望，使其与 PreYes 实际配置（`fire_budget_usdc=15.0`, `paper_initial_capital_usdc=700.0`, `yes_min_ask=0.45`, `yes_max_ask=0.75`）完全一致。
+  - 优化 `tests_live.py` 中的限价与可成交性测试，防止由于 PreYes 的 0.75 上限导致 0.80 价格覆盖误触发价格超限。
+  - **测试全绿**：`tests_port.py` (31/31 PASS)、`tests_live.py` (51/51 PASS)、`tests_consensus_lock.py` (11/11 PASS)、`tests_cycle_consensus_lock.py` (2/2 PASS)、其余核心回测套件 (47/47 PASS)。总计 142 个测试用例在 Windows 与 WSL Linux 双环境下保持 100% 通过。
+
+## 2026-09-11 — LIVE 执行层 Phase 1-3b 完整迁移 + CLOB v2 适配 + PreYes 稳了策略兼容
+
+- **执行端口化架构 (`live/port.py`, `_r_cycle.py`)**：
+  - 遵循 **live ≡ paper** 核心原则（同策略、同判定、同基建、同账本），执行差异封装于成交通道：`PaperPort` 走内存 FAK 撮合，`LivePort` 走 CLOB v2 真实下单与对账。
+  - 在 `_r_cycle._paper_fire` 接入 `get_port(cfg)`。在 `mode=live` 且未满足三重闸门时抛出 `PortRefused` 并记录 `fire_port_refused` 审计事件，**绝对不开仓、绝不静默降级为 paper**。
+- **PreYes 稳了策略专用腿兼容 (`live/order_plan.py`)**：
+  - 适配 `strategy_consensus_lock.py` 独有的 `buy_yes_lock` 腿，将其纳入 `BUY_DIRECTIONS`，并映射上限至 `cfg['yes_max_ask']`（0.75），完美兼容稳了策略的高胜率锁定信号。
+- **CLOB v2 全面迁移 (`live/v2_transport.py`, `live/clob_client.py`)**：
+  - 淘汰已失效的 CLOB v1，全面采用 `py-clob-client-v2`。
+  - 凭据显式传入，撤单统一调用 `cancel_orders([id])`，查单使用 `get_open_orders()`。
+  - 下单前必须重新获取盘口并夹紧限价（`clamp_limit` + `refetch_book`），避免 `order crosses book`。
+  - 成交对账轮询获取真实成交量和均价。撤单失败重试 3 次，仍失败标记 `residual_risk=True`。
+  - 25 个写操作方法默认全部装载运行时抛异常哨兵，仅最小权限开放 `post_order` 与 `cancel_orders`。
+- **生产级三重安全闸门 (`live/risk_gate.py`, `live/submit.py`)**：
+  - 1) CLI / 环境变量 `YES2RE_LIVE_ENABLE_SUBMIT=1`
+  - 2) 机器级标志 `LIVE_SUBMIT_ENABLED=1`（不写进 `.env`，防止误起）
+  - 3) 当日 UTC 动态短语 `YES2RE_LIVE_CONFIRM=SMOKE-<YYYY-MM-DD>`（跨日自动失效，防止无人值守放量）
+- **单配置双实例环境覆盖 (`_r_state.py`)**：
+  - `config/yes2re_reversal.json` 保持 `mode: "paper"` 防止误触。
+  - 支持 4 个环境变量覆盖：`YES2RE_MODE`、`YES2RE_FIRE_BUDGET_USDC`、`YES2RE_MAX_OPEN_POSITIONS`、`YES2RE_INITIAL_CAPITAL_USDC`。非法值严格 fail-closed。
+- **网络与海外 VPS 直连兼容 (`market_ws_transport.py`)**：
+  - 移植 `resolve_default_proxy()` 及直连 TLS，自动识别海外无代理直连环境与本地开发代理环境。
+- **测试套件与运维工具**：
+  - 新增 `tests_port.py` (16/16 PASS) 与 `tests_live.py` (50/50 PASS)。原有 6 个策略与流程测试套件 100% 保持通过。
+  - 引入 `DEPLOY_RUNBOOK.md`、`ops/PENDING.md`、`ops/repair_log_live.md`、`run_live.sh`、`scripts/analyze_events.py`、`scripts/monitor_live.py`。
+
 
 - **`reversal_strategy.py` fire window switched from single-edge bounds to
   inclusive local hour intervals.** One-bucket reversal fires now gate on:

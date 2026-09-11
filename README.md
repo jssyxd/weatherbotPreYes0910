@@ -11,7 +11,20 @@ METAR vs consensus **reversal** + **PreYes "稳了" Consensus Lock-in Strategy**
   - Risk Lock: Max 2 fires/reverses per session to avoid multi-jump cascading loss.
   - Unit Tests: `python tests_consensus_lock.py` (8/8 PASS).
 
-**No σ. No fade-NO / BUY-YES grid. No wallet. Paper only.**
+**No σ. No fade-NO / BUY-YES grid. Paper by default, with opt-in CLOB v2 Live execution.**
+
+## Execution Ports (live ≡ paper)
+
+- **Architecture**:
+  - `PaperPort`: In-memory L2 FAK matching, zero network order execution.
+  - `LivePort`: Polymarket CLOB v2 live execution with non-marketable limit orders (`postOnly`), TOCTOU book refetch, and fill reconciliation.
+- Both ports share the identical strategy engine (`strategy_consensus_lock.py` + `reversal_strategy.py`), consensus logic, arming windows, leg sizing, and accounting rules.
+- **Safety Lock**: `config/yes2re_reversal.json` defaults strictly to `mode: paper`. Live mode can only be activated via environment variables (`YES2RE_MODE=live`) guarded by three independent gates:
+  1. `YES2RE_LIVE_ENABLE_SUBMIT=1`
+  2. `LIVE_SUBMIT_ENABLED=1`
+  3. `YES2RE_LIVE_CONFIRM=SMOKE-<UTC-date>`
+  If any gate is missing, the engine raises `PortRefused` and fails closed (will **never** silently fall back to paper or execute unverified orders).
+- Detailed live setup and operational guide: see [`live/README.md`](live/README.md) and [`DEPLOY_RUNBOOK.md`](DEPLOY_RUNBOOK.md).
 
 ## Rules
 
@@ -20,9 +33,9 @@ METAR vs consensus **reversal** + **PreYes "稳了" Consensus Lock-in Strategy**
 - YES leg only if jump exactly 1 bucket; jump ≥ 2 → NO-only.
 - New `obs_time`, age ≤ 180s; high local hour ≥ 14; low ≤ 10.
 - Broken bucket must be rank-1 over `consensus_window_seconds` (default 7200).
-- Legs: BUY NO broken (cap 0.65, 75%) + optional BUY YES new (cap 0.48, 25%).
+- Legs: BUY NO broken (cap 0.65, 75%) + optional BUY YES new (cap 0.48, 25%), or PreYes `buy_yes_lock` (cap 0.75).
 - Idle ~20s; **ARM** → fast poll those ICAOs (~10s) while **full universe** still samples books/METAR slowly for consensus.
-- FIRE: in-memory L2 FAK, 8s budget, abort above cap. One fire per `city|date|direction`.
+- FIRE: in-memory L2 FAK (paper) or CLOB v2 non-marketable post-only limit (live). One fire per `city|date|direction`.
 
 ## Data path
 
@@ -39,6 +52,9 @@ METAR vs consensus **reversal** + **PreYes "稳了" Consensus Lock-in Strategy**
 ```bash
 export CHECKWX_API_KEY=...   # still useful; AWC works without key
 python3 tests_reversal.py
+python3 tests_consensus_lock.py
+python3 tests_port.py
+python3 tests_live.py
 python3 reversal_runner.py once --config config/yes2re_reversal.json
 python3 reversal_runner.py run  --config config/yes2re_reversal.json
 ```
@@ -55,9 +71,10 @@ WSL: `networkingMode=mirrored` for Gamma/CLOB.
 
 ## poly-yes2
 
-This repo is the **canonical reversal paper** stack. Archive or ignore poly-yes2 treeB for reversal.
+This repo is the **canonical reversal paper & live** stack. Archive or ignore poly-yes2 treeB for reversal.
 Keep poly-yes2 only if you still need the old three-arm / Hermes / settlement-review history.
 
 ## Safety
 
-`reversal_runner.py` hard-blocks any mode other than `paper`.
+`reversal_runner.py` blocks unvalidated modes; config file cannot set `mode: live`. Live mode strictly requires environment variable overrides and triple-barrier gate confirmation.
+
