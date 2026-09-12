@@ -1,5 +1,39 @@
 # Changelog — weatherbotPreYes0910
 
+## 2026-09-12 — CRITICAL: 修 neg_risk 签名域丢失（实盘 fire 100% 下不出去）+ 引擎预算与 live 上限对齐
+
+**背景（真实链路演练实测暴露，非推断）**：用引擎自身链路 `_r_cycle._paper_fire` 在真实市场下单，连续 3 次被 CLOB 拒绝：
+```
+400 {"error":"invalid POLY_PROXY signature"}
+```
+链路本身正常（`plan_fire_cycle` → `send_fak limit=0.72 shares=10` → 端口 taker 决策正确），
+失败发生在签名域：**天气桶市场是 neg-risk 市场**，而引擎的梯子缓存里没有 `neg_risk` 字段。
+
+- **根因**：`_r_cycle._normalize_snapshot()` 只透传 `best_ask/best_bid/tick_size/asks/bids`，
+  丢掉了 `execution/market.py` `BookView` 里已有的 `neg_risk`（和 `min_order_size`）。
+  `live/port.py` 于是 `bool(book.get("neg_risk"))` = False ⇒ 按**非** neg-risk 交易所签名
+  ⇒ CLOB 判签名无效。**只要市场是 neg-risk，实盘 fire 就永远发不出去**（静默失败）。
+- **修复 1（根因）** `_r_cycle._normalize_snapshot`：透传 `neg_risk` / `min_order_size`。
+  这两项纯元数据，`paper_match_fak` 不读 ⇒ paper 行为不变（`paper_reversal_sim --scenarios-only`
+  输出 sha256 `3d16632c…` 与基线逐字一致，已实测）。
+- **修复 2（纵深防御）** `live/port.py LivePort.resolve_neg_risk()`：盘口缺该字段时用 live 客户端
+  重取一次盘口（CLOB `/book` 带 `neg_risk`，与 `refetch_book` 同源）并按 token 缓存；
+  **仍取不到 ⇒ 拒单（`neg_risk_unknown`，fail-closed）**，绝不按错误签名域硬发。
+  审计行新增 `neg_risk` / `neg_risk_source`。
+- **修复 3（配置对齐，服务器 .env）**：引擎 fire 预算来自 `cfg.fire_budget_usdc`（config=**15**），
+  而 live 端口用 `check_limits(notional=15, fire_budget=LIVE_FIRE_BUDGET_USDC=10)` ⇒
+  `15 > 10` ⇒ **每次 fire 被 `limit_fire_budget` 拒绝**。故在服务器 `.env` 增加引擎级覆盖
+  `YES2RE_FIRE_BUDGET_USDC=10`（尊重操作者设定的单笔实盘上限 10，且不改共享 config）。
+- **验证（真实资金，磨损可接受）**：修复后重跑引擎链路演练 ⇒ **真实成交**
+  `Shanghai 28°C`：`buy_yes_new send_fak limit=0.66 shares=10.00 → filled 10.153845 @0.66`
+  （账本记账 cost 6.701538 USDC），随后 FAK 卖回 `10.15 @0.56`（`0xc84665f7…`），
+  账户回零（balance 51.375982→50.219453，positions 0，open_orders 0），净磨损 1.156529 USDC。
+- 测试：`tests_port` 31/31、`tests_live` 51/51、`tests_consensus_lock` 11/11、
+  `tests_cycle_consensus_lock` 集成全绿、`tests_fill_gate` 6 场景、`tests_reversal`、
+  `tests_sleeve_signal` 13/13、`tests_sleeve_wiring` 4/4。
+- 说明：演练写入生产 `data/live_events.jsonl` 的 4 行（2 笔订单，00:41:31 BUY / 00:41:39 SELL）
+  是**演练单**，非策略 fire。
+
 ## 2026-09-12 — 统一 YES 吃单带为 0.75（fire 范围 ≡ live taker 带门）
 - `config/yes2re_reversal.json`：`consensus_lock.yes_max_ask` **0.80 → 0.75**；`strategy_consensus_lock.py` 内置换默认同步 0.75。
 - 原因（操作者拍板）：live 端口 taker 带门读 `strategy.yes_max_ask`（= 0.75），而 PreYes 入场顶价原为 0.80 ⇒ fire 限价落在 **(0.75, 0.80]** 时实盘会 `yes_price_above_band` 跳过（"fire 却不成交"），纸面/实盘同区间分歧。统一后三处一致：`consensus_lock.yes_max_ask` = `strategy.yes_max_ask` = `risk_control_yes_cap` = **0.75**。

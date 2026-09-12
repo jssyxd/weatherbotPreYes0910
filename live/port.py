@@ -371,6 +371,37 @@ class LivePort(ExecutionPort):
         #: fire-level YES-price memo (see ``_fire_yes_price``) — keyed by the exact fire dict
         self._band_fire: dict | None = None
         self._band_ctx: dict | None = None
+        #: token -> neg_risk 签名域缓存（盘口缺该字段时用 live 客户端重取一次）
+        self._neg_risk_cache: dict[str, bool] = {}
+
+    def resolve_neg_risk(self, client, token_id, book) -> tuple[bool | None, str]:
+        """返回 ``(neg_risk, source)``。
+
+        neg-risk 市场的订单**必须**用 neg-risk 交易所做 EIP-712 签名，否则 CLOB 以
+        ``invalid POLY_PROXY signature`` 直接拒单（实盘 fire 会 100% 静默下不出去）。
+        盘口自带该字段就用它；缺失时用 live 客户端重取一次盘口（CLOB ``/book`` 响应带
+        ``neg_risk``，与 ``refetch_book`` 同源）并按 token 缓存；仍取不到 ⇒ ``None``，
+        调用方 fail-closed（弃单，绝不按错误的签名域硬发）。
+        """
+        if isinstance(book, dict) and book.get("neg_risk") is not None:
+            return bool(book["neg_risk"]), "book"
+        tok = str(token_id or "")
+        if not tok:
+            return None, "no_token"
+        if tok in self._neg_risk_cache:
+            return self._neg_risk_cache[tok], "cache"
+        refetch = getattr(self.transport, "refetch_book", None)
+        if not callable(refetch):
+            return None, "no_refetch_api"
+        try:
+            fresh = refetch(client, tok) or {}
+        except Exception:  # noqa: BLE001 - lookup failure ⇒ fail closed below
+            return None, "refetch_failed"
+        got = fresh.get("neg_risk") if isinstance(fresh, dict) else None
+        if got is None:
+            return None, "unknown"
+        self._neg_risk_cache[tok] = bool(got)
+        return bool(got), "refetch"
 
     # ---------------------------------------------------------------- preflight
     def _read_account(self, client, credentials) -> dict:
@@ -553,6 +584,16 @@ class LivePort(ExecutionPort):
                     "order_mode": SKIP, "taker_gate": ctx["taker_gate"],
                     "yes_price": ctx["yes_price"], "fill_and_kill": False, "source": LIVE}
         token_id = leg.get("token_id")
+        neg_risk, neg_src = self.resolve_neg_risk(client, token_id, book)
+        if neg_risk is None:
+            # 签名域未知 ⇒ 弃单（fail-closed）。按错误的 neg-risk 域签名会被 CLOB 以
+            # "invalid POLY_PROXY signature" 拒绝，那是静默失败的源头。
+            return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
+                    "status": "neg_risk_unknown", "order_id": None, "residual_risk": False,
+                    "limit_price": None, "clamped": False, "source": LIVE,
+                    "detail": "neg-risk signing domain unknown; refusing to sign a mis-scoped order",
+                    "order_mode": SKIP, "neg_risk_source": neg_src,
+                    "yes_price": ctx["yes_price"], "fill_and_kill": False}
         result = self.transport.execute_leg(
             client,
             token_id=str(token_id),
@@ -561,7 +602,7 @@ class LivePort(ExecutionPort):
             size=shares,
             book=book,
             tick=leg.get("tick") or (book or {}).get("tick_size") if isinstance(book, dict) else None,
-            neg_risk=bool((book or {}).get("neg_risk")) if isinstance(book, dict) else None,
+            neg_risk=bool(neg_risk),
             gates=self.gates,
             post_only=False,
             clamp=False,
@@ -571,7 +612,7 @@ class LivePort(ExecutionPort):
             poll_sleep=self.poll_sleep,
             sleep=self.sleep,
             audit_path=self.audit_path,
-            audit_extra=audit_extra,
+            audit_extra={**audit_extra, "neg_risk": bool(neg_risk), "neg_risk_source": neg_src},
         )
         return {"filled_shares": result.get("filled_shares") or ZERO,
                 "avg_price": result.get("avg_price"),

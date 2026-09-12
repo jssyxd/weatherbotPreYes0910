@@ -370,6 +370,12 @@ def _normalize_snapshot(token_id: str, snapshot: Any) -> dict[str, Any] | None:
         "tick_size": str(view.tick_size) if view.tick_size is not None else "0.01",
         "asks": asks,
         "bids": bids,
+        # neg-risk 市场的订单必须按 neg-risk 交易所做 EIP-712 签名，否则 CLOB 直接
+        # 以 "invalid POLY_PROXY signature" 拒单（实盘 fire 会 100% 下不出去）。
+        # 这两项只是随盘口透传元数据，paper 匹配器（paper_match_fak）不读它们，
+        # 因此 paper 行为逐字不变。
+        "neg_risk": view.neg_risk,
+        "min_order_size": (str(view.min_order_size) if view.min_order_size is not None else None),
         "fetched_at_epoch": snapshot.fetched_at_epoch if hasattr(snapshot, "fetched_at_epoch") else time.time(),
     }
 
