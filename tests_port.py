@@ -716,7 +716,11 @@ GOLDEN_CONFIG = json.loads(r"""
   "next_bucket_max_instant_bid": "0.15",
   "next_bucket_max_twap": "0.26",
   "next_bucket_twap_window_s": 3600,
-  "order_budget_usdc": 15.0,
+  "next_entry_budget_pct": "0.5",
+  "next_entry_enabled": true,
+  "next_entry_max_ask": "0.32",
+  "next_entry_min_ask": "0.20",
+  "order_budget_usdc": 10.0,
   "risk_control_no_cap": "0.85",
   "risk_control_yes_cap": "0.75",
   "yes_max_ask": "0.75",
@@ -724,7 +728,7 @@ GOLDEN_CONFIG = json.loads(r"""
  },
  "contract_cities_path": "config/contract_cities.json",
  "fast_poll_interval_seconds": 5,
- "fire_budget_usdc": 15.0,
+ "fire_budget_usdc": 10.0,
  "health_path": "data/yes2re_health.json",
  "idle_book_interval_seconds": 30,
  "idle_metar_interval_seconds": 30,
@@ -826,7 +830,7 @@ def test_load_config_env_overrides():
 
     baseline = _r_state.load_config("config/yes2re_reversal.json")
     assert baseline == GOLDEN_CONFIG, "no-env load_config changed vs the pre-change baseline"
-    assert baseline["mode"] == "paper" and baseline["fire_budget_usdc"] == 15.0
+    assert baseline["mode"] == "paper" and baseline["fire_budget_usdc"] == 10.0
     assert baseline["max_open_positions"] == 12
     assert baseline["strategy"] == GOLDEN_STRATEGY
 
@@ -1841,6 +1845,166 @@ def _patched(module, **attributes):
             setattr(module, name, value)
 
 
+# ------------------- parallel next-bucket channel: leg-level window + audit (2026-09-12)
+
+#: the parallel channel's own window, as the strategy/engine write it on the fire and the leg
+NEXT_WINDOW = "(0.20, 0.32]"
+NEXT_BOOK = {"best_ask": "0.25", "best_bid": "0.10", "tick_size": "0.01", "neg_risk": True}
+
+NEXT_FIRE = {
+    "key": "london|2026-09-10|high", "city_id": "london", "icao": "EGLL",
+    "market_local_date": "2026-09-10", "local_fire_time": "2026-09-10T14:05:00+01:00",
+    "market_unit": "C", "direction": "high", "ref_extreme": 26.0, "ref_source": "market_rank1",
+    "running_extreme": 26.0, "jump": 0, "fire_no": 1, "budget_usdc": "6.0",
+    "entry_channel": "next_bucket", "next_entry_window": NEXT_WINDOW,
+    "target_bucket_id": "B2", "new_bucket_id": "B2",
+    "legs": [{"leg": "buy_yes_next", "token_id": "TOK_NEXT", "side": "BUY", "outcome": "YES",
+              "cap": "0.32", "floor": "0.20", "notional_pct": "1.0", "bucket_id": "B2",
+              "entry_channel": "next_bucket"}],
+}
+
+
+def _next_leg(px=None, *, cap="0.32", floor="0.20", token="TOK_NEXT") -> dict:
+    """The next-channel YES leg the ladder intent hands to ``match`` (own floor/cap + channel)."""
+    leg: dict = {"leg": "buy_yes_next", "token_id": token, "side": "BUY", "outcome": "YES",
+                 "cap": cap, "floor": floor, "notional_pct": "1.0", "entry_channel": "next_bucket"}
+    if px is not None:
+        leg["best_ask"] = str(px)
+    return leg
+
+
+def _next_fire(px=None, **overrides):
+    fire = copy.deepcopy(NEXT_FIRE)
+    fire.update(overrides)
+    if px is not None:
+        fire["ladder"] = [{"leg": "buy_yes_next", "outcome": "YES", "best_ask": str(px)}]
+    return fire
+
+
+def test_live_taker_next_entry_leg_window_gate():
+    """腿级窗口贯通：新通道的 YES 腿由**腿自带** (floor, cap] 判定，cfg 的 0.45/0.75 动不了它。
+
+    矩阵 (0.20, 0.32]：0.199/0.200/0.201/0.319/0.320/0.321 ⇒ 弃/弃/入/入/入/弃；每一次都统计
+    ``execute_leg`` 调用数（带外必须为 0 ⇒ 零降级），并在三套不同的 cfg 窗口下重复（结果不变）。
+    """
+    cfg_bands = [
+        CFG,                                                        # 端口默认 0.48/0.90
+        {"strategy": {"yes_min_ask": "0.45", "yes_max_ask": "0.75"}},  # 部署配置
+        {"yes_min_ask": "0.10", "yes_max_ask": "0.99"},              # 极端放宽
+    ]
+    probes = [("0.199", False), ("0.200", False), ("0.201", True),
+              ("0.319", True), ("0.320", True), ("0.321", False)]
+    print("  [live next-entry leg window] leg floor/cap = 0.20/0.32 (own window; cfg band ignored)")
+    for cfg in cfg_bands:
+        for raw, want in probes:
+            got, t = _run(_next_leg(raw), fire=_next_fire(raw), cfg=cfg, book=NEXT_BOOK,
+                          limit="0.30")
+            calls = _sent(t)
+            print(f"    cfg={cfg.get('strategy') or cfg.get('yes_min_ask') or 'defaults'} "
+                  f"next_ask={raw:>6} -> {'taker' if want else 'skip':5} execute_leg_calls={len(calls)}"
+                  f" window={got.get('leg_window')}")
+            assert got["order_mode"] == ("taker" if want else "skip"), (cfg, raw, got)
+            assert len(calls) == (1 if want else 0), (cfg, raw, t.calls)
+            assert got["entry_channel"] == "next_bucket", (cfg, raw, got)
+            assert got["leg_window"] == NEXT_WINDOW, (cfg, raw, got)
+            if want:
+                assert calls[0]["taker"] is True and calls[0]["post_only"] is False, calls
+                assert calls[0]["leg_channel"] == "next_bucket", calls
+                assert calls[0]["leg_window"] == NEXT_WINDOW, calls
+            else:
+                # 零降级：带外时一笔都不发，且绝不出现 post_only（被动）单
+                assert not [c for c in calls if c.get("post_only") is True], (cfg, raw, t.calls)
+            assert not [c for c in calls if c.get("post_only") is True], (cfg, raw, t.calls)
+
+    # 改腿窗口 ⇒ 该腿判定随之变化（窗口是腿自有的）
+    for raw, want in (("0.249", False), ("0.251", True), ("0.299", True), ("0.301", False)):
+        got, t = _run(_next_leg(raw, floor="0.25", cap="0.30"), fire=_next_fire(raw), cfg=CFG,
+                      book=NEXT_BOOK, limit="0.30")
+        assert got["order_mode"] == ("taker" if want else "skip"), (raw, got)
+        assert got["leg_window"] == "(0.25, 0.30]", (raw, got)
+        assert len(_sent(t)) == (1 if want else 0), (raw, t.calls)
+
+    # 既有目标桶腿（无 entry_channel）继续按 cfg 窗口判定，且不受本次改动影响
+    target_band = {"strategy": {"yes_min_ask": "0.45", "yes_max_ask": "0.75"}}
+    for raw, want in (("0.45", False), ("0.4501", True), ("0.7499", True), ("0.75", True),
+                      ("0.7501", False)):
+        got, t = _run(_yes_leg(raw), fire=_yes_fire(raw), cfg=target_band, book=TAKER_BOOK)
+        assert got["order_mode"] == ("taker" if want else "skip"), (raw, got)
+        assert got.get("entry_channel") is None, (raw, got, "legacy legs must stay unchanneled")
+        assert len(_sent(t)) == (1 if want else 0), (raw, t.calls)
+    # 既有非法 cfg 窗口仍然 fail-closed（语义未变）
+    got, t = _run(_yes_leg("0.60"), fire=_yes_fire("0.60"),
+                  cfg={"yes_min_ask": "0.95", "yes_max_ask": "0.90"}, book=TAKER_BOOK)
+    assert got["status"] == "yes_band_unparsed" and _sent(t) == [], got
+
+    # 腿窗口非法 ⇒ leg_window_unusable 弃单，**绝不回退** cfg 窗口（0.60 在 0.45/0.75 内也一样）
+    for cap, floor in (("0.32", "0.40"), ("0.32", "NaN"), ("0.32", "-0.1"), ("0.32", "abc")):
+        got, t = _run(_next_leg("0.60", cap=cap, floor=floor), fire=_next_fire("0.60"),
+                      cfg=target_band, book=NEXT_BOOK, limit="0.30")
+        assert got["status"] == "leg_window_unusable", (cap, floor, got)
+        assert got["order_mode"] == "skip" and _sent(t) == [], (cap, floor, t.calls)
+        assert got["filled_shares"] == ZERO and got["fill_and_kill"] is False, got
+    # 只缺 floor（或 floor=0）⇒ 视为无下界 (0, cap]，仍是腿自带窗口而不是 cfg 窗口
+    win_missing_floor = port_mod.leg_take_window(_next_leg("0.25", floor="0"), _next_fire("0.25"),
+                                                 target_band)
+    assert win_missing_floor["ok"] and win_missing_floor["lo"] == ZERO \
+        and win_missing_floor["hi"] == Decimal("0.32"), win_missing_floor
+    got, t = _run(_next_leg("0.25", floor="0"), fire=_next_fire("0.25"), cfg=target_band,
+                  book=NEXT_BOOK, limit="0.30")
+    assert got["order_mode"] == "taker", got
+    got, t = _run(_next_leg("0.60", floor=""), fire=_next_fire("0.60"), cfg=target_band,
+                  book=NEXT_BOOK, limit="0.30")
+    assert got["order_mode"] == "skip" and _sent(t) == [], got
+
+
+def test_live_taker_next_entry_channel_audit_not_spoofable():
+    """审计可区分通道（entry_channel / leg_window / next_entry_window）且**不可被 audit_extra 伪造**。"""
+    # (a) 端口层：腿里塞一个 AuditExtra 伪造块，端口只用自己从腿推导的权威值
+    spoof = {"entry_channel": "target_bucket", "leg_window": "(0.45, 0.75]", "taker_gate_ok": False}
+    leg = _next_leg("0.25")
+    leg["audit_extra"] = dict(spoof)
+    got, t = _run(leg, fire=_next_fire("0.25"), cfg=CFG, book=NEXT_BOOK, limit="0.30")
+    call = _sent(t)[0]
+    assert call["leg_channel"] == "next_bucket" and call["leg_window"] == NEXT_WINDOW, call
+    assert call["audit_extra"]["entry_channel"] == "next_bucket", call["audit_extra"]
+    assert call["audit_extra"]["leg_window"] == NEXT_WINDOW, call["audit_extra"]
+    assert call["audit_extra"]["window_source"] == "leg_window", call["audit_extra"]
+    assert call["audit_extra"]["next_entry_window"] == NEXT_WINDOW, call["audit_extra"]
+    assert call["audit_extra"]["taker_gate_ok"] is True, call["audit_extra"]
+
+    # (b) 传输层：audit_extra 里的同名字段先被剔除，再由专用入参盖章
+    def _rows(**kw):
+        client = _taker_client(matched="10", price="0.30", token="TOK_NEXT")
+        with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+            log = Path(tmp) / "live_events.jsonl"
+            out = v2_transport.execute_leg(
+                client, token_id="TOK_NEXT", side="BUY", price="0.30", size="10",
+                book=TAKER_BOOK, gates=GATES_OK, taker=True, cap="0.32", audit_path=log,
+                sleep=lambda _s: None, poll_attempts=2, **kw)
+            lines = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return out, lines
+
+    out, lines = _rows(audit_extra=dict(spoof))
+    assert out["ok"] is True, out
+    assert [line["action"] for line in lines] == ["intent", "submit"], lines
+    for line in lines:
+        assert "entry_channel" not in line["params"], line
+        assert "leg_window" not in line["params"], line
+
+    out, lines = _rows(audit_extra=dict(spoof), leg_channel="next_bucket", leg_window=NEXT_WINDOW)
+    assert out["ok"] is True, out
+    for line in lines:
+        assert line["params"]["entry_channel"] == "next_bucket", line
+        assert line["params"]["leg_window"] == NEXT_WINDOW, line
+        assert line["params"].get("order_mode") == "taker", line
+
+    # 端口把自己实现的规则也广告出来（通道 + 腿级窗口规则）
+    described = _live_port(_StubTransport(), account=ACCOUNT_OK, preflight=True).describe()
+    assert described["entry_channels"] == ["target_bucket", "next_bucket"], described
+    assert described["passive_fallback"] is False, described
+    assert "buy_yes_next" in described["yes_legs"], described
+
+
 CHECKS = [
     ("config: env overrides (mode/budget/max_open)", test_load_config_env_overrides),
     ("config: live via env still needs port gates", test_env_override_live_still_needs_port_gates),
@@ -1873,6 +2037,8 @@ CHECKS = [
     ("live taker: limits kept, band fail-closed", test_live_taker_limits_and_band_fail_closed),
     ("live taker: pure decision adds no audit row (L-1)", test_live_taker_decision_alone_is_not_audited),
     ("live taker: engine fire path is leg-level", test_live_fire_intent_is_leg_level),
+    ("live next-entry: leg window drives the take (cfg band ignored)", test_live_taker_next_entry_leg_window_gate),
+    ("live next-entry: channel audit, not spoofable by audit_extra", test_live_taker_next_entry_channel_audit_not_spoofable),
 ]
 
 

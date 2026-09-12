@@ -1,5 +1,55 @@
 # Changelog — weatherbotPreYes0910
 
+## 2026-09-12 — 新增并行通道 `buy_yes_next`「下一档桶廉价入场」（**代码默认关闭，config 显式开启**）
+
+**决策依据（实测，非推断）**：`/home/da/桌面/poly-yes2/preyes_param_sim_20260912.md` §4/§5/§6。
+既有目标桶通道的非价格门**全部通过**时，目标桶 ask 已被市场定价到 **0.81–0.99**，被最后一门
+`yes_max_ask=0.75` 挡死 ⇒ 8 小时 **零成交**（`entry_count=0`）；时间对齐证明 TWAP/instant 放宽
+的**边际新增机会 = 0**（几十秒自解），唯一能多出机会的参数是 cap，但那条路是"追高"、两种口径
+EV 皆负（−10%~−25%）。结论：要「极高胜率 + 廉价入场」必须**改入场对象** ⇒ 在"下一档桶"报价
+低廉时直接建仓该桶。
+
+- **新通道 `buy_yes_next`**（并行、优先评估）：触发前置 = 与既有通道**逐字一致的非价格门**
+  （站点频次 → 时间窗 → 速度/变率 → 预期极值桶位已确认 → 共识 **rank1**），价格约束换成该通道
+  **自有且独立**的窗口 `(next_entry_min_ask, next_entry_max_ask]`（默认 **0.20 不含 / 0.32 含**）。
+  **区间外 ⇒ 彻底弃单**：不降级、不挂被动单、不回退既有窗口。
+  > 语义替代（有意为之）：下一档桶的 **twap/instant 价格子门**（0.26/0.25/0.15）是既有目标桶
+  > 通道的过滤器，新通道用自有窗口替代它 —— 目标桶通道的窗口/门序/判定价逻辑**一字未改**。
+- **与既有通道的关系**：新通道命中 ⇒ 既有通道该 tick 不下单；新通道弃单 ⇒ 既有目标桶通道按原
+  逻辑（窗口仍为 (0.45, 0.75]）独立判定。**预算隔离**：新通道用
+  `next_entry_budget_pct`（默认 0.5）× fire 预算；既有通道只用剩余额度（`15 − 7.5 = 7.5`）。
+  会话上限沿用既有 `max_fires_per_session` 语义（不新增超出既有上限的并发）。
+- **腿级窗口贯通到 live 端口 taker 带门**：新通道腿自带 `floor`/`cap`，`LivePort.fill_mode`
+  以**腿自带窗口**判定（`entry_channel == "next_bucket"`），cfg 的 `yes_min_ask/yes_max_ask`
+  动不了它；腿窗口缺失/非法 ⇒ `leg_window_unusable` **fail-closed**（绝不回退成 cfg 窗口）；
+  仅"完全无腿窗口"才按规范回退 cfg。ladder intent 现在透传 `floor`/`entry_channel`（加法式）。
+- **审计**：`intent`/`submit` 与 `data/live_events.jsonl` 新增 `entry_channel`
+  (`next_bucket`/`target_bucket`)、`leg_window`、`window_source`、`next_entry_window`；
+  通道字段由**专用入参**盖章（合并 `audit_extra` 之后），外部 `audit_extra` 同名值先被剔除
+  ⇒ **不可伪造/翻转**。`data/yes2re_events.jsonl` 的 `fire` 行同样带通道字段。
+- **配置**（`consensus_lock` 块）：`next_entry_enabled` / `next_entry_min_ask` / `next_entry_max_ask` /
+  `next_entry_budget_pct`。`strategy_consensus_lock.py::DEFAULT_CONFIG` 同名键但
+  **`next_entry_enabled: false`**（代码默认保守）；本仓 `config/yes2re_reversal.json` 显式开启。
+- **引擎入口 fire 构造提取为 `_r_cycle.consensus_entry_fire(...)`**（可测的生产分支）：两通道的
+  腿/窗口/预算/审计字段在此一处组装；既有目标桶通道的 fire 内容逐字不变（仅新增 `entry_channel` /
+  `next_entry_window` / 预算量化）。顺带修一处**绑定缺陷**：HEAD 的入口 fire 分支引用 `ZoneInfo`，
+  而该名字只由 TAF 块内的一处 local import 绑定（同一函数作用域）⇒ **有 TAF 时正常、无 TAF
+  （`market_rank1` 回退）时 `UnboundLocalError` 并中断整轮**（同类缺陷在本仓已有先例：sleeve 调用点
+  的热修注释）。提取后函数自行绑定 `ZoneInfo` ⇒ 常规行为不变、无 TAF 时不再炸。**未动**：破位反手
+  fire 分支（`_r_cycle` 内同一 `ZoneInfo` 形状）保持原样，属既有缺陷，需操作者另案决定。
+- **验证**（原始输出见 `/tmp/preyes_next_bucket_impl_report.md`）：`tests_consensus_lock` 15/15、
+  `tests_cycle_consensus_lock` 4/4、`tests_port` **33/33**、`tests_live` 51/51、`tests_reversal` 24、
+  `tests_fill_gate` 6、`tests_sleeve_signal` 13、`tests_sleeve_wiring` 4、`tests_market_adapter` 4；
+  边界矩阵 0.199/0.200/0.201/0.319/0.320/0.321 ⇒ 弃/弃/入/入/入/弃（策略层 + 端口层各一套）；
+  带外 `execute_leg` 调用数 = 0；既有通道 33 场景投影与 `ccbd0c8` **逐场景一致**（默认关闭 0 差异；
+  开启时 5 处差异全部是"新通道成交"）；`paper_reversal_sim.py --scenarios-only` sha256
+  `3d16632c…` **与基线逐字一致**；3 组变异（区间外降级 / 闭区间 / 忽略预算隔离）全部被对应用例捕获
+  并逐字还原（sha256 复原）。
+- **风险（如实记录）**：EV 前提「市场系统性低估该桶」**未经结算验证**（8h 样本无法证实，见报告
+  §5.3）⇒ 通道默认关闭、部署保持小额（本仓 = 0.5 × 15 USDC = 7.5 USDC 名义/次，且受 live 端
+  `LIVE_FIRE_BUDGET_USDC`/`LIVE_MAX_CAPITAL_USDC` 约束）；单笔最大损失 = 该通道预算；一键关闭 =
+  `next_entry_enabled: false`（立即回到今日行为，既有通道逐行不变）。
+
 ## 2026-09-12 — 修 settle_failed 根因（裸 socket 读超时中断整轮结算；同步自共享引擎）
 
 - **同缺陷**：`market_adapter._fetch_json` 未处理裸 `TimeoutError`（socket 读超时不包成 `URLError`）→ 穿透 `fetch_market_resolution` 的窄捕获 → `_r_cycle` 记 `settle_failed` 并**中止整轮结算**。两仓 `market_adapter.py` md5 相同，属共享引擎缺陷。

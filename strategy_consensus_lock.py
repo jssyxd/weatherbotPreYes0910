@@ -14,6 +14,19 @@
    - 严格继承线上实战检验的 Session 计数器（fires_count <= 2）；
    - 反手时对破位桶 NO 做真实微观结构检查：NO 卖价 <= 0.85 才买，若 NO 已被扫空至 0.99/1.00 则自动跳过；
    - 杜绝连续跳桶引发的双重亏损（Double Wipeout）。
+
+4. 【并行通道 - 下一档桶廉价入场 (buy_yes_next)，默认关闭】:
+   - 实测依据：`preyes_param_sim_20260912.md` §5/§6 —— 既有目标桶通道的非价格门全通过时，
+     目标桶 ask 已被市场定价到 0.81–0.99（被 cap 0.75 挡死，8 小时零成交）；而"下一档桶"
+     报价 q<=0.30 的入口也被同一个 cap 封死 ⇒ 放宽任何价格阈值都换不来机会。
+   - 因此**改变入场对象**：在"下一档桶"报价低廉时直接建仓该桶的 YES。
+   - 非价格门与既有通道**逐字一致、一个都不放松**（站点频次 → 时间窗 → 速度/变率 →
+     预期极值桶位 → 共识 rank1）；价格约束换成该通道**自有且独立**的窗口
+     `(next_entry_min_ask, next_entry_max_ask]`（默认 (0.20, 0.32]，半开）。
+   - 区间外 ⇒ **彻底弃单**（绝不降级、绝不挂被动单、绝不回退既有窗口）；与既有通道
+     **预算隔离**（新通道用 `next_entry_budget_pct` × fire 预算，既有通道只用剩余额度）。
+   - ⚠ EV 前提（"市场系统性低估该桶"）未经结算验证 ⇒ 代码默认 `next_entry_enabled=false`，
+     部署由 config 显式开启，且必须保持小额、可一键关闭。
 """
 from __future__ import annotations
 
@@ -84,7 +97,21 @@ DEFAULT_CONFIG = {
     "max_fires_per_session": 2,                       # 单日同一标的最多 2 次 (初次 + 1次追火，止损后熔断阻断)
     "risk_control_no_cap": Decimal("0.85"),           # 破位 NO 腿超过 0.85 坚决不买 (防扫空)
     "risk_control_yes_cap": Decimal("0.75"),          # 新 YES 腿同样限顶价 0.75
+    # ------------------------------------------------------------------ 并行通道
+    # 下一档桶廉价入场 (buy_yes_next)：入场对象 = 当前预期极值桶的"上一档"桶，价格窗口自有独立。
+    # 代码默认**关闭**（EV 前提未经结算验证）；本次部署由 config/yes2re_reversal.json 显式开启。
+    "next_entry_enabled": False,
+    "next_entry_min_ask": Decimal("0.20"),            # 窗口下界（半开：0.20 本身不含 ⇒ 弃单）
+    "next_entry_max_ask": Decimal("0.32"),            # 窗口上界（半开：0.32 本身含 ⇒ 入场）
+    "next_entry_budget_pct": Decimal("0.5"),          # 通道预算 = fire 预算 × 0.5（与既有通道隔离）
 }
+
+#: 通道标识（写进 fire/腿/审计，用来区分来源）
+CHANNEL_TARGET = "target_bucket"     # 既有目标桶通道（yes_min_ask/yes_max_ask = 0.45/0.75）
+CHANNEL_NEXT = "next_bucket"         # 新增"下一档桶廉价入场"通道（next_entry_min/max_ask）
+
+#: 新通道腿名（端口 YES 腿判定为数据镜像，见 live/port.py::YES_LEG_NAMES）
+NEXT_ENTRY_LEG = "buy_yes_next"
 
 
 def _dec(val: Any, default: str = "0") -> Decimal:
@@ -94,6 +121,38 @@ def _dec(val: Any, default: str = "0") -> Decimal:
         return Decimal(str(val))
     except Exception:
         return Decimal(default)
+
+
+def _dec_or_none(val: Any) -> Decimal | None:
+    """严格解析（不可解析/非有限 ⇒ ``None``）；窗口配置必须用它，绝不用默认值兜底。"""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        out = Decimal(str(val).strip())
+    except Exception:
+        return None
+    return out if out.is_finite() else None
+
+
+def parse_next_entry_window(cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """解析并行通道"下一档桶廉价入场"的**自有**价格窗口 ``(next_entry_min_ask, next_entry_max_ask]``。
+
+    半开区间：下界**不含**（ask == lo ⇒ 弃单）、上界**含**（ask == hi ⇒ 入场），与既有通道
+    ``(yes_min_ask, yes_max_ask]`` 同一约定。任何不可用配置（缺失/不可解析/负数/上界 > 1/
+    ``lo >= hi``）一律返回 ``ok=False`` ⇒ 调用方**整通道弃单**，绝不回退既有窗口、绝不降级挂单。
+    纯函数：只读 ``cfg``。
+    """
+    src = cfg if isinstance(cfg, dict) else {}
+    lo_raw = src.get("next_entry_min_ask", DEFAULT_CONFIG["next_entry_min_ask"])
+    hi_raw = src.get("next_entry_max_ask", DEFAULT_CONFIG["next_entry_max_ask"])
+    lo = _dec_or_none(lo_raw)
+    hi = _dec_or_none(hi_raw)
+    if lo is None or hi is None or lo < ZERO or hi > ONE or lo >= hi:
+        return {"ok": False, "lo": None, "hi": None, "label": None,
+                "detail": (f"next-entry window unusable (next_entry_min_ask={lo_raw!r}, "
+                           f"next_entry_max_ask={hi_raw!r}) — 整通道弃单（不回退既有窗口）")}
+    return {"ok": True, "lo": lo, "hi": hi, "label": f"({lo}, {hi}]",
+            "detail": f"({lo}, {hi}] (half-open: {lo} excluded, {hi} included)"}
 
 
 def bucket_contains(bucket: dict[str, Any], val: float) -> bool:
@@ -210,6 +269,9 @@ class ConsensusLockState:
     session_fires_count: dict[str, int] = field(default_factory=dict)  # session_key -> int
     breached_sessions: set[str] = field(default_factory=set)
     stopped_out_sessions: set[str] = field(default_factory=set)        # 触发提前止损熔断标的
+    #: 预算隔离（加法式）：新通道在每个会话已占用的名义额度（USDC）。
+    #: 既有目标桶通道只用 ``fire 预算 − 这里的占用`` ⇒ 两通道永不重复花同一笔钱。
+    session_next_entry_used: dict[str, Decimal] = field(default_factory=dict)
 
 
 class ConsensusLockStrategy:
@@ -217,6 +279,8 @@ class ConsensusLockStrategy:
         self.cfg = {**DEFAULT_CONFIG, **(cfg or {})}
         self.state = ConsensusLockState()
         self._metar_history: dict[str, list[dict[str, Any]]] = {}      # session_key -> [{"temp": float, "obs_time": float, "recorded_at": float}]
+        #: 上一次"下一档桶通道"为何没下单（审计用；`next_entry_disabled` ⇒ None）
+        self.last_next_entry_skip: str | None = None
 
     def is_fast_station(self, city_id: str) -> bool:
         if not self.cfg.get("filter_fast_stations_only", True):
@@ -249,8 +313,16 @@ class ConsensusLockStrategy:
         tracker: ConsensusTracker,
         now_utc: datetime,
         books_by_token: dict[str, Any] | None = None,
+        price_gates: bool = True,
     ) -> tuple[bool, str, dict[str, Any]]:
-        """检查 target_bk 是否为共识第一 (Rank-1) 且下一档可能破位的桶稳定 < 26¢ 且瞬时盘口未异动。"""
+        """检查 target_bk 是否为共识第一 (Rank-1) 且下一档可能破位的桶稳定 < 26¢ 且瞬时盘口未异动。
+
+        ``price_gates``（加法式开关，默认 ``True`` ⇒ 既有目标桶通道逐字不变）：
+        为 ``False`` 时**只**做非价格判定（rank1 + 下一档桶定位），把下一档的价格子门
+        （twap / instant ask / instant bid）留给调用方自己的价格窗口 —— 这正是并行通道
+        "下一档桶廉价入场" 的用法（其自有窗口 ``(next_entry_min_ask, next_entry_max_ask]``
+        取代这三个子门）。子门读数仍完整写入 ``meta`` 作为证据，只是不再拦截。
+        """
         meta: dict[str, Any] = {}
         ranked = tracker.rank_buckets(
             city_id, market_local_date, direction,
@@ -286,7 +358,8 @@ class ConsensusLockStrategy:
             meta["next_bucket_twap"] = str(next_twap) if next_twap is not None else "none"
 
             max_allowed = _dec(self.cfg["next_bucket_max_twap"], "0.26")
-            if next_twap is not None and next_twap >= max_allowed:
+            # 价格子门：``price_gates=False``（并行通道）时只留读数作为证据，不拦截。
+            if price_gates and next_twap is not None and next_twap >= max_allowed:
                 return False, f"next_bucket_twap_too_high ({next_twap} >= {max_allowed})", meta
 
             # 防线 3: 下一档瞬时盘口校验 (弥补 1h TWAP 滞后性)
@@ -300,17 +373,182 @@ class ConsensusLockStrategy:
                     meta["next_bucket_instant_bid"] = str(next_bid) if next_bid is not None else "none"
 
                     max_instant_ask = _dec(self.cfg.get("next_bucket_max_instant_ask", "0.25"), "0.25")
-                    if next_ask is not None and next_ask >= max_instant_ask:
+                    if price_gates and next_ask is not None and next_ask >= max_instant_ask:
                         return False, f"next_bucket_instant_ask_too_high ({next_ask} >= {max_instant_ask})", meta
 
                     max_instant_bid = _dec(self.cfg.get("next_bucket_max_instant_bid", "0.15"), "0.15")
-                    if next_bid is not None and next_bid >= max_instant_bid:
+                    if price_gates and next_bid is not None and next_bid >= max_instant_bid:
                         return False, f"next_bucket_instant_bid_too_high ({next_bid} >= {max_instant_bid})", meta
         else:
             meta["next_bucket_id"] = "boundary_terminal"
             meta["next_bucket_twap"] = "0"
 
         return True, "ok", meta
+
+    # ------------------------------------------------------- 并行通道: 下一档桶廉价入场
+    def next_entry_window(self) -> dict[str, Any]:
+        """本通道**自有**价格窗口 ``(next_entry_min_ask, next_entry_max_ask]``（半开）。"""
+        return parse_next_entry_window(self.cfg)
+
+    def next_entry_window_label(self) -> str | None:
+        """窗口的可读标签（审计用；配置不可用时 ``None``）。"""
+        return self.next_entry_window().get("label")
+
+    def target_channel_budget(self, session_key: str, fire_budget: Decimal | str) -> Decimal:
+        """预算隔离：既有目标桶通道在某会话可用的额度 = fire 预算 − 新通道已占用。
+
+        新通道每次 fire 把 ``next_entry_budget_pct × fire 预算`` 记进
+        ``state.session_next_entry_used``；这里把同一笔钱从既有通道的额度里扣掉，
+        两个通道**永不重复花同一份预算**（默认无新通道 fire ⇒ 返回值 == fire 预算，
+        与改动前逐字一致）。
+        """
+        used = self.state.session_next_entry_used.get(session_key) or ZERO
+        left = _dec(fire_budget, "0") - used
+        return left if left > ZERO else ZERO
+
+    def evaluate_next_bucket_entry(
+        self,
+        city: dict[str, Any],
+        market_local_date: str,
+        direction: str,
+        ordered_bks: list[dict[str, Any]],
+        target_bk: dict[str, Any],
+        tracker: ConsensusTracker,
+        now_utc: datetime,
+        books_by_token: dict[str, Any] | None,
+        cur_fires: int,
+        expected_extreme_temp: float | None,
+    ) -> dict[str, Any]:
+        """并行通道：**下一档桶廉价入场**（``next_entry_enabled``，代码默认关闭）。
+
+        调用约定（由 ``evaluate_entry`` 在 1–5 门之后、共识价格子门之前调用）：
+        非价格门（站点频次 / 会话计数 / 时间窗 / METAR / 速度-变率 / 预期极值桶位）**已逐字
+        通过**；共识这里只要 **rank1**（``price_gates=False``）。入场对象 = 下一档桶
+        （``new_bucket_id`` 对应桶）的 YES token；价格约束 = 本通道**自有且独立**的窗口。
+
+        返回 fire dict（``action == "execute_taker_fire"``, ``entry_channel == "next_bucket"``）
+        或 skip dict（原因写明，调用方继续既有通道）。区间外/无盘口/窗口非法一律
+        **彻底弃单**：不挂被动单、不降级、不回退既有窗口。风控（三重闸门、risk_gate、
+        check_limits、tick 对齐、min_order_size）仍由 live 端口按腿独立执行，此处不涉及。
+        """
+        city_id = city["city_id"]
+        key = f"{city_id}|{market_local_date}|{direction}"
+        if not self.cfg.get("next_entry_enabled", False):
+            return {"action": "skip", "reason": "next_entry_disabled", "key": key,
+                    "entry_channel": CHANNEL_NEXT}
+        win = self.next_entry_window()
+        if not win["ok"]:
+            return {"action": "skip", "reason": f"next_entry_window_invalid ({win['detail']})",
+                    "key": key, "entry_channel": CHANNEL_NEXT}
+
+        # 共识：只要 rank1（下一档的价格子门由本通道自有窗口取代；读数仍写进 meta 作证据）
+        ok_cons, reason_cons, meta_cons = self.check_consensus_and_next_bucket(
+            city_id, market_local_date, direction, ordered_bks, target_bk, tracker,
+            now_utc, books_by_token, price_gates=False,
+        )
+        if not ok_cons:
+            return {"action": "skip", "reason": f"next_entry_consensus_failed: {reason_cons}",
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+
+        next_id = str(meta_cons.get("next_bucket_id") or "")
+        if not next_id or next_id == "boundary_terminal":
+            return {"action": "skip", "reason": "next_entry_no_next_bucket", "key": key,
+                    "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+        next_bk = next(
+            (b for b in ordered_bks
+             if str(b.get("bucket_id") or b.get("id") or "") == next_id),
+            None,
+        )
+        if not next_bk:
+            return {"action": "skip", "reason": f"next_entry_bucket_not_in_ladder ({next_id})",
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+
+        tok_next = next_bk.get("yes_token_id") or next_bk.get("_yes_token_id")
+        if not tok_next:
+            return {"action": "skip", "reason": "next_entry_no_yes_token_for_next_bucket",
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+        next_book = (books_by_token or {}).get(str(tok_next))
+        if not next_book:
+            return {"action": "skip", "reason": "next_entry_book_missing",
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+        next_ask = get_best_ask(next_book)
+        if next_ask is None:
+            return {"action": "skip", "reason": "next_entry_no_active_ask",
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+        # 半开窗口：lo 不含、hi 含。区间外 ⇒ 彻底弃单（绝不降级/绝不挂被动单）。
+        if next_ask <= win["lo"]:
+            return {"action": "skip",
+                    "reason": (f"next_entry_ask_below_window ({next_ask} <= {win['lo']}; "
+                               f"window {win['label']})"),
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+        if next_ask > win["hi"]:
+            return {"action": "skip",
+                    "reason": (f"next_entry_ask_above_window ({next_ask} > {win['hi']}; "
+                               f"window {win['label']})"),
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+
+        pct_raw = self.cfg.get("next_entry_budget_pct", DEFAULT_CONFIG["next_entry_budget_pct"])
+        pct = _dec_or_none(pct_raw)
+        if pct is None or pct <= ZERO or pct > ONE:
+            return {"action": "skip",
+                    "reason": f"next_entry_budget_pct_invalid ({pct_raw!r}; need 0 < pct <= 1)",
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+        budget = (_dec(self.cfg.get("order_budget_usdc"), "15.0") * pct).quantize(Decimal("0.01"))
+        shares = (budget / next_ask).to_integral_value(rounding=ROUND_DOWN)
+        if shares <= ZERO:
+            return {"action": "skip", "reason": "next_entry_zero_shares_calculated",
+                    "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
+        cost = next_ask * shares
+
+        # 与既有 capped_taker 分支同构的账务：记仓位、锁会话、推进计数（沿用既有语义）
+        pos = PositionRecord(
+            session_key=key,
+            bucket_id=next_id,
+            yes_token_id=str(tok_next),
+            shares=shares,
+            cost_usdc=cost,
+            avg_price=next_ask,
+            entry_ts_utc=now_utc.isoformat(),
+            liquidated=False,
+        )
+        self.state.open_positions[key] = pos
+        self.state.locked_sessions[key] = {
+            "locked_at": now_utc.isoformat(),
+            "target_bucket_id": next_id,
+            "expected_temp": expected_extreme_temp,
+            "consensus_meta": meta_cons,
+            "entry_channel": CHANNEL_NEXT,
+            "entry_window": win["label"],
+        }
+        self.state.session_fires_count[key] = cur_fires + 1
+        # 预算隔离簿记：本会话新通道占用的名义额度（既有通道只剩 fire 预算 − 这笔）
+        self.state.session_next_entry_used[key] = budget
+
+        return {
+            "action": "execute_taker_fire",
+            "key": key,
+            "entry_channel": CHANNEL_NEXT,
+            "entry_mode": "capped_taker",
+            "fire_no": self.state.session_fires_count[key],
+            "bucket_id": next_id,
+            "token_id": str(tok_next),
+            "side": "BUY",
+            "outcome": "YES",
+            "fill_price": str(next_ask),
+            "shares": str(shares),
+            "cost_usdc": str(cost),
+            "cap": str(win["hi"]),
+            "floor": str(win["lo"]),
+            "window": win["label"],
+            "next_entry_window": win["label"],
+            "budget_pct": str(pct),
+            "budget_usdc": str(budget),
+            "bucket_lo": next_bk.get("lo"),
+            "bucket_hi": next_bk.get("hi"),
+            "bucket_label": next_bk.get("label") or next_bk.get("bucket_label"),
+            "consensus_meta": meta_cons,
+            "detail": f"next_bucket_cheap_entry (ask {next_ask} in {win['label']})",
+        }
 
     def evaluate_entry(
         self,
@@ -327,6 +565,8 @@ class ConsensusLockStrategy:
         """评估是否触发 '稳了' 入场 (优化版：默认 Capped Taker，避免挂单逆向选择)。"""
         city_id = city["city_id"]
         key = f"{city_id}|{market_local_date}|{direction}"
+        # 并行通道审计字段按 tick 重置：只有本 tick 真的评估过新通道才会有原因（additive）
+        self.last_next_entry_skip = None
 
         # 1. 站点频次筛选 (只做 <=30min 站点)
         if not self.is_fast_station(city_id):
@@ -411,6 +651,19 @@ class ConsensusLockStrategy:
             elif c_idx < t_idx:
                 return {"action": "skip", "reason": f"already_exceeded_expected_low ({curr_temp} < expected {expected_extreme_temp})", "key": key}
 
+        # 5b. 并行通道：下一档桶廉价入场（`next_entry_enabled` 默认 False ⇒ 本块是 no-op，
+        #     既有目标桶路径逐行不变）。非价格门由上面 1–5 门逐字保证；本通道只换入场对象
+        #     （下一档桶 YES）与其**自有**价格窗口。命中 ⇒ 直接返回（既有通道本次不下单）；
+        #     未命中/区间外 ⇒ 只记下原因，继续走下方既有逻辑（绝不降级、绝不挂被动单）。
+        next_res = self.evaluate_next_bucket_entry(
+            city, market_local_date, direction, ordered, target_bucket, tracker,
+            now_utc, books_by_token, cur_fires, expected_extreme_temp,
+        )
+        self.last_next_entry_skip = (None if next_res.get("reason") == "next_entry_disabled"
+                                     else next_res.get("reason"))
+        if next_res.get("action") == "execute_taker_fire":
+            return next_res
+
         # 6. 检查共识第一 + 下一档桶价格与瞬时盘口 (防线 3: 瞬时盘口校验)
         ok_cons, reason_cons, meta_cons = self.check_consensus_and_next_bucket(
             city_id, market_local_date, direction, ordered, target_bucket, tracker, now_utc, books_by_token
@@ -471,6 +724,8 @@ class ConsensusLockStrategy:
             return {
                 "action": "execute_taker_fire",
                 "key": key,
+                # 通道标识（加法式，2026-09-12）：既有目标桶通道；引擎据此写审计字段
+                "entry_channel": CHANNEL_TARGET,
                 "entry_mode": "capped_taker",
                 "fire_no": self.state.session_fires_count[key],
                 "bucket_id": t_id,

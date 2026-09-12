@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
 from consensus_tracker import ConsensusTracker
 from strategy_consensus_lock import (
@@ -364,6 +364,241 @@ def test_next_bucket_instantaneous_book_checks():
     print("PASS: 11. test_next_bucket_instantaneous_book_checks (瞬时盘口双向校验生效)")
 
 
+# --------------------------------------------------------------------------- #
+# 并行通道：下一档桶廉价入场 (buy_yes_next)  —— 2026-09-12
+# 依据 preyes_param_sim_20260912.md §5/§6：既有通道的非价格门全通过时目标桶 ask 已被
+# 定价到 0.81–0.99（cap 0.75 挡死 ⇒ 8h 零成交）⇒ 改入场对象为"下一档桶"，窗口自有独立。
+# --------------------------------------------------------------------------- #
+NEXT_CFG = {
+    "next_entry_enabled": True,
+    "next_entry_min_ask": "0.20",
+    "next_entry_max_ask": "0.32",
+    "next_entry_budget_pct": "0.5",
+    "order_budget_usdc": "15.0",
+}
+
+
+def _next_entry_case(ask_next: str, *, ask_target: str = "0.90", cfg_extra: dict | None = None,
+                     enabled: bool = True, samples: bool = True, now_utc=None, city=None,
+                     temp: float = 31.2, obs_age_s: float = 2000.0, expected: float | None = 31.0,
+                     date_str: str = "2026-09-10", dir_str: str = "high",
+                     next_sample_ask: str = "0.12"):
+    """一个"非价格门全通过 + 给定下一档桶 ask"的场景（新通道测试用）。
+
+    `ask_target` 默认 0.90 = 实盘观测到的目标桶报价（被既有 cap 0.75 挡死）；`ask_next` 是新通道
+    唯一的变量；`next_sample_ask` 决定 tracker 里下一档桶的历史 TWAP（0.12 ⇒ ~0.10，低于既有
+    0.26 门）。返回 (strat, res, tracker, now, city, books)。
+    """
+    cfg = dict(NEXT_CFG) if enabled else dict(NEXT_CFG, next_entry_enabled=False)
+    cfg.update(cfg_extra or {})
+    strat = ConsensusLockStrategy(cfg)
+    city = city or make_city("paris")
+    bks = make_buckets()                     # b29..b33 (Y29..Y33)；target=b31，next=b32
+    tracker = ConsensusTracker()
+    if samples:
+        next_bid = str(Decimal(next_sample_ask) - Decimal("0.02"))
+        for step in range(10):
+            ts = datetime(2026, 9, 10, 12, 10 + step, 0, tzinfo=timezone.utc)
+            tracker.record_books("paris", date_str, dir_str, bks, {
+                "Y31": {"best_bid": "0.65", "best_ask": "0.68"},
+                "Y32": {"best_bid": next_bid, "best_ask": next_sample_ask},
+            }, ts)
+    now = now_utc or datetime(2026, 9, 10, 13, 0, 0, tzinfo=timezone.utc)   # Paris 15:00 本地
+    books = {
+        "Y31": {"best_bid": "0.80", "best_ask": ask_target, "tick_size": "0.01"},
+        "Y32": {"best_bid": "0.10", "best_ask": ask_next, "tick_size": "0.01"},
+    }
+    obs = {"temp_c": temp, "obs_age_s": obs_age_s}
+    res = strat.evaluate_entry(city, date_str, dir_str, bks, expected, obs, books, tracker, now)
+    return strat, res, tracker, now, city, books
+
+
+def test_next_entry_channel_default_off_and_config_gate():
+    """① 代码默认关闭（保守）；② 部署 config 显式开启；③ 非法窗口 fail-closed 不回退。"""
+    default = ConsensusLockStrategy()
+    assert default.cfg["next_entry_enabled"] is False, "代码默认必须是关闭"
+    win = default.next_entry_window()
+    assert win["ok"] is True and str(win["lo"]) == "0.20" and str(win["hi"]) == "0.32"
+    assert win["label"] == "(0.20, 0.32]"
+
+    # 关闭态：即使下一档桶 ask=0.25 在窗口内，也必须走既有通道（被既有共识/顶价门挡下）
+    strat_off, res_off, *_ = _next_entry_case("0.25", enabled=False)
+    assert res_off["action"] == "skip", res_off
+    assert ("ask_above_safety_cap" in res_off["reason"]
+            or "next_bucket_instant_ask_too_high" in res_off["reason"]), res_off
+    assert strat_off.last_next_entry_skip is None, "未评估的新通道不留审计噪声"
+    assert "paris|2026-09-10|high" not in strat_off.state.open_positions
+
+    # 开启态：同一场景由新通道成交（证明 window 是唯一的开关差异）
+    strat_on, res_on, *_ = _next_entry_case("0.25", enabled=True)
+    assert res_on["action"] == "execute_taker_fire"
+    assert res_on["entry_channel"] == "next_bucket"
+    assert res_on["bucket_id"] == "b32" and res_on["token_id"] == "Y32"
+
+    # 明确的语义替代（有意为之，报告里如实记录）：下一档桶的 twap/instant **价格子门**
+    # （0.26/0.25/0.15）是既有目标桶通道的过滤器；新通道用**自有窗口** (0.20, 0.32] 替代它，
+    # 因此 twap>=0.26 时新通道仍可入场 —— 但 ask 必须落在窗口内（见边界矩阵：0.321 仍弃单）。
+    strat_sub, res_sub, *_ = _next_entry_case("0.25", next_sample_ask="0.41")
+    assert float(res_sub["consensus_meta"]["next_bucket_twap"]) >= 0.26, res_sub
+    assert res_sub["action"] == "execute_taker_fire" and res_sub["entry_channel"] == "next_bucket", res_sub
+    # 同一 fixture、通道关闭 ⇒ 既有通道被 twap 价格子门挡死（证明这里确实是"替代"而非"绕过"）
+    _, res_sub_off, *_ = _next_entry_case("0.25", next_sample_ask="0.41", enabled=False)
+    assert res_sub_off["action"] == "skip" and "next_bucket_twap_too_high" in res_sub_off["reason"], res_sub_off
+
+    # 非法窗口（lo >= hi）⇒ 整通道弃单，绝不回退既有 (0.45, 0.75]：
+    # 下一档 0.20 让既有通道的共识门通过 ⇒ 若新通道错误回退窗口，成交来源就会变成 next_bucket
+    strat_bad, res_bad, *_ = _next_entry_case(
+        "0.20", ask_target="0.60", cfg_extra={"next_entry_min_ask": "0.40", "next_entry_max_ask": "0.32"})
+    assert strat_bad.last_next_entry_skip and "next_entry_window_invalid" in strat_bad.last_next_entry_skip
+    assert res_bad["action"] == "execute_taker_fire", res_bad
+    assert res_bad["entry_channel"] == "target_bucket" and res_bad["bucket_id"] == "b31", \
+        "非法窗口时只能是既有通道按自己的窗口成交（绝不回退成新通道窗口）"
+    for bad_lo, bad_hi in (("abc", "0.32"), ("0.20", "NaN"), ("-0.1", "0.32"), ("0.20", "1.5"), ("0.3", "0.3")):
+        w = ConsensusLockStrategy({"next_entry_min_ask": bad_lo, "next_entry_max_ask": bad_hi}).next_entry_window()
+        assert w["ok"] is False, (bad_lo, bad_hi, w)
+    print("PASS: 12. test_next_entry_channel_default_off_and_config_gate "
+          "(默认关闭 / config 开启 / 非法窗口 fail-closed 不回退)")
+
+
+def test_next_entry_window_boundary_matrix():
+    """窗口边界矩阵 (0.20, 0.32]：0.199/0.200/0.201/0.319/0.320/0.321 ⇒ 弃/弃/入/入/入/弃。"""
+    probes = [("0.199", "skip"), ("0.200", "skip"), ("0.201", "fire"),
+              ("0.319", "fire"), ("0.320", "fire"), ("0.321", "skip")]
+    print("  [next-entry window boundary matrix] window = (0.20, 0.32]  (half-open)")
+    for raw, want in probes:
+        strat, res, *_ = _next_entry_case(raw)
+        got = "fire" if res.get("action") == "execute_taker_fire" else "skip"
+        skip_reason = strat.last_next_entry_skip
+        print(f"    next_ask={raw:>6} -> {got:4}  channel={res.get('entry_channel') or 'n/a':>12}"
+              f"  next_entry_skip={skip_reason}")
+        assert got == want, (raw, want, res)
+        if want == "fire":
+            assert res["entry_channel"] == "next_bucket" and res["bucket_id"] == "b32", res
+            assert res["floor"] == "0.20" and res["cap"] == "0.32", res
+            assert res["window"] == "(0.20, 0.32]" and res["next_entry_window"] == "(0.20, 0.32]", res
+            assert Decimal(res["fill_price"]) == Decimal(raw), res
+            assert Decimal(res["shares"]) * Decimal(res["fill_price"]) <= Decimal("7.50"), res
+            assert Decimal(res["shares"]) == (Decimal("7.50") / Decimal(raw)).to_integral_value(
+                rounding=ROUND_DOWN), res
+        else:
+            expect = "next_entry_ask_below_window" if Decimal(raw) <= Decimal("0.20") \
+                else "next_entry_ask_above_window"
+            assert skip_reason and expect in skip_reason, (raw, skip_reason)
+            # 弃单 ⇒ 新通道没有任何仓位/额度占用
+            assert strat.state.session_next_entry_used.get("paris|2026-09-10|high") is None
+    # 半开端点的精确复核：0.20 本身弃单、0.32 本身入场
+    s1, r1, *_ = _next_entry_case("0.2")
+    assert r1["action"] == "skip" and "next_entry_ask_below_window" in (s1.last_next_entry_skip or "")
+    s2, r2, *_ = _next_entry_case("0.32")
+    assert r2["action"] == "execute_taker_fire", r2
+    # 窗口是自有且独立的：改窗口 ⇒ 边界随之移动
+    s3, r3, *_ = _next_entry_case("0.26", cfg_extra={"next_entry_min_ask": "0.28"})
+    assert r3["action"] == "skip" and "next_entry_ask_below_window" in (s3.last_next_entry_skip or "")
+    print("PASS: 13. test_next_entry_window_boundary_matrix (半开窗口 6 组边界全部符合预期)")
+
+
+def test_next_entry_priority_and_budget_isolation():
+    """通道优先级 + 预算隔离：新通道先评估；命中则既有通道不下单；两者预算永不重叠。"""
+    key = "paris|2026-09-10|high"
+    # (a) 两个通道同时可成交（目标桶 0.60 ∈ (0.45,0.75]；下一档 0.25 ∈ (0.20,0.32]）
+    strat, res, *_ = _next_entry_case("0.25", ask_target="0.60")
+    assert res["action"] == "execute_taker_fire", res
+    assert res["entry_channel"] == "next_bucket", "新通道必须优先，既有通道本次不得下单"
+    assert res["bucket_id"] == "b32" and res["token_id"] == "Y32", res
+    assert Decimal(res["shares"]) == Decimal("30")            # floor(7.5 / 0.25)
+    assert Decimal(res["cost_usdc"]) == Decimal("7.50")
+    assert res["budget_usdc"] == "7.50" and res["budget_pct"] == "0.5"
+    assert strat.state.session_next_entry_used[key] == Decimal("7.50")
+    # 既有通道只剩剩余额度（7.5 已被新通道占用 ⇒ 15 − 7.5 = 7.5）
+    assert strat.target_channel_budget(key, Decimal("15")) == Decimal("7.50")
+    assert Decimal(res["cost_usdc"]) <= Decimal("15")         # 总名义额 ≤ fire 预算
+    # 会话上限沿用既有语义：同会话已有持仓 ⇒ 两个通道都不再 fire
+    res_again = strat.evaluate_entry(
+        make_city("paris"), "2026-09-10", "high", make_buckets(), 31.0,
+        {"temp_c": 31.2, "obs_age_s": 2000}, {
+            "Y31": {"best_bid": "0.80", "best_ask": "0.60"},
+            "Y32": {"best_bid": "0.10", "best_ask": "0.25"}}, ConsensusTracker(),
+        datetime(2026, 9, 10, 13, 5, 0, tzinfo=timezone.utc))
+    assert res_again["action"] == "skip" and res_again["reason"] == "session_already_has_open_position"
+
+    # (b) 新通道弃单（下一档 0.20 == 窗口下界，半开区间不含）⇒ 既有通道按**原窗口**独立判定并成交
+    strat2, res2, *_ = _next_entry_case("0.20", ask_target="0.60")
+    assert strat2.last_next_entry_skip and "next_entry_ask_below_window" in strat2.last_next_entry_skip
+    assert res2["action"] == "execute_taker_fire", res2
+    assert res2["entry_channel"] == "target_bucket" and res2["bucket_id"] == "b31", res2
+    assert res2["cap"] == "0.75", res2                       # 既有窗口一字未改
+    assert Decimal(res2["shares"]) == Decimal("25")          # floor(15 / 0.60) ⇒ 吃满 fire 预算
+    assert strat2.target_channel_budget(key, Decimal("15")) == Decimal("15")
+    assert strat2.state.session_next_entry_used.get(key) is None, "弃单不得占用任何额度"
+    assert Decimal(res2["cost_usdc"]) <= Decimal("15")
+
+    # (c) 下一档 ask 高于窗口（0.40）⇒ 新通道弃单，且任何成交都不可能是下一档桶
+    strat3, res3, *_ = _next_entry_case("0.40", ask_target="0.60")
+    assert strat3.last_next_entry_skip and "next_entry_ask_above_window" in strat3.last_next_entry_skip
+    assert res3.get("entry_channel") != "next_bucket", res3
+    assert strat3.state.session_next_entry_used.get(key) is None
+    print("PASS: 14. test_next_entry_priority_and_budget_isolation "
+          "(新通道优先 / 既有通道独立 / 15−7.5=7.5 剩余额度)")
+
+
+def test_next_entry_non_price_gates_not_relaxed():
+    """非价格门一个都不放松：站点/时间窗/预期极值/变率/共识 rank1 任一不过 ⇒ 新通道也不 fire。"""
+    key = "paris|2026-09-10|high"
+    # ① 站点频次门（filter_fast_stations_only=True 时非白名单站点被挡）
+    strat, res, *_ = _next_entry_case("0.25", city=make_city("testville", "UTC", "TEST"),
+                                      cfg_extra={"filter_fast_stations_only": True})
+    assert res["action"] == "skip" and res["reason"] == "infrequent_metar_station", res
+    assert res.get("entry_channel") != "next_bucket"
+
+    # ② 时间窗门（Paris 06:00Z = 08:00 本地，不在 14–18）
+    strat, res, *_ = _next_entry_case("0.25", now_utc=datetime(2026, 9, 10, 6, 0, 0, tzinfo=timezone.utc))
+    assert res["action"] == "skip" and "outside_time_window" in res["reason"], res
+
+    # ③ 预期极值桶位门（气温还没到预期极值）
+    strat, res, *_ = _next_entry_case("0.25", temp=30.2)
+    assert res["action"] == "skip" and "not_reached_expected_high" in res["reason"], res
+
+    # ④ 速度/变率门（刚跳升未停滞）
+    strat = ConsensusLockStrategy(NEXT_CFG)
+    city = make_city("helsinki", "Europe/Helsinki", "EFHK")
+    bks = make_buckets()
+    tracker = ConsensusTracker()
+    tracker.record_books("helsinki", "2026-09-10", "high", bks, {
+        "Y31": {"best_bid": "0.65", "best_ask": "0.70"}, "Y32": {"best_bid": "0.08", "best_ask": "0.12"}},
+        datetime(2026, 9, 10, 12, 10, 0, tzinfo=timezone.utc))
+    books = {"Y31": {"best_bid": "0.80", "best_ask": "0.90"},
+             "Y32": {"best_bid": "0.10", "best_ask": "0.25"}}
+    t0 = datetime(2026, 9, 10, 12, 10, 0, tzinfo=timezone.utc)
+    strat.evaluate_entry(city, "2026-09-10", "high", bks, 31.0, {"temp_c": 30.0, "obs_age_s": 600},
+                         books, tracker, t0)
+    t1 = t0 + timedelta(minutes=10)
+    res = strat.evaluate_entry(city, "2026-09-10", "high", bks, 31.0, {"temp_c": 31.0, "obs_age_s": 60},
+                               books, tracker, t1)
+    assert res["action"] == "skip" and "temperature_rising_velocity_active" in res["reason"], res
+    assert res.get("entry_channel") != "next_bucket"
+
+    # ⑤ 共识 rank1 门（rank1 是另一个桶 ⇒ 新通道同样拒绝，哪怕下一档 ask 在窗口内）
+    strat = ConsensusLockStrategy(NEXT_CFG)
+    tracker = ConsensusTracker()
+    for step in range(10):
+        ts = datetime(2026, 9, 10, 12, 10 + step, 0, tzinfo=timezone.utc)
+        tracker.record_books("paris", "2026-09-10", "high", bks, {
+            "Y31": {"best_bid": "0.10", "best_ask": "0.12"},       # target 便宜（非 rank1）
+            "Y32": {"best_bid": "0.65", "best_ask": "0.70"},       # 别的桶才是 rank1
+        }, ts)
+    res = strat.evaluate_entry(make_city("paris"), "2026-09-10", "high", bks, 31.0,
+                               {"temp_c": 31.2, "obs_age_s": 2000}, {
+                                   "Y31": {"best_bid": "0.10", "best_ask": "0.60"},
+                                   "Y32": {"best_bid": "0.10", "best_ask": "0.25"}},
+                               tracker, datetime(2026, 9, 10, 13, 0, 0, tzinfo=timezone.utc))
+    assert res["action"] == "skip" and "target_is_not_rank1" in res["reason"], res
+    assert res.get("entry_channel") != "next_bucket"
+    assert strat.last_next_entry_skip and "target_is_not_rank1" in strat.last_next_entry_skip
+    assert key not in strat.state.open_positions
+    print("PASS: 15. test_next_entry_non_price_gates_not_relaxed "
+          "(站点/时间窗/极值桶位/变率/共识 rank1 五门全部仍然拦截)")
+
+
 def main():
     test_station_filter()
     test_time_window()
@@ -376,7 +611,11 @@ def main():
     test_post_stop_loss_cooldown()
     test_temperature_velocity_stalling_filter()
     test_next_bucket_instantaneous_book_checks()
-    print("\nALL 11 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
+    test_next_entry_channel_default_off_and_config_gate()
+    test_next_entry_window_boundary_matrix()
+    test_next_entry_priority_and_budget_isolation()
+    test_next_entry_non_price_gates_not_relaxed()
+    print("\nALL 15 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

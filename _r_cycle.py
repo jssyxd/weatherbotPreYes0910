@@ -41,6 +41,9 @@ from research import common
 from reversal_strategy import ensure_re_state, maybe_arm_or_fire, prune_stale_sessions
 from ws_bridge import ws_bridge
 from strategy_consensus_lock import (
+    CHANNEL_NEXT,
+    CHANNEL_TARGET,
+    NEXT_ENTRY_LEG,
     ConsensusLockStrategy,
     PositionRecord,
     FAST_METAR_CITIES,
@@ -879,6 +882,11 @@ def _paper_fire(
         budget = (Decimal(str(cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"]))) * pct).quantize(Decimal("0.01"))
     else:
         budget = Decimal(str(cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"])))
+        # 通道预算隔离（加法式，2026-09-12）：只有声明了 `entry_channel` 的 entry fire 才用它自带的
+        # `budget_usdc`（新通道 = pct × fire 预算 / 既有通道 = 剩余额度）。既有 fire（追火/反手/
+        # sleeve/反转策略）不带该键 ⇒ 逐字沿用 cfg 预算，行为不变。
+        if fire.get("entry_channel") and fire.get("budget_usdc"):
+            budget = Decimal(str(fire["budget_usdc"]))
     remaining = re_execution.size_legs(fire, budget)
     fills: dict[str, dict[str, Any]] = {}
     ladlog: list[dict[str, Any]] = []
@@ -958,6 +966,10 @@ def _paper_fire(
         "running_extreme": fire.get("running_extreme"),
         "jump": fire.get("jump"),
         "budget_usdc": str(budget),
+        # 入场通道（2026-09-12）：让账本/审计能区分目标桶通道与"下一档桶廉价入场"通道
+        # （既有 fire 不带 entry_channel ⇒ 保持 None，additive）
+        "entry_channel": fire.get("entry_channel"),
+        "next_entry_window": fire.get("next_entry_window"),
         "settled": False,
         "legs": [],
     }
@@ -989,8 +1001,8 @@ def _paper_fire(
         name = str(leg["leg"])
         if name == "buy_no_broken":
             bucket_id = fire.get("broken_bucket_id")
-        elif name in ("buy_yes_new", "buy_yes_sleeve"):
-            bucket_id = fire.get("new_bucket_id")
+        elif name in ("buy_yes_new", "buy_yes_sleeve", "buy_yes_next"):
+            bucket_id = fire.get("new_bucket_id") or leg.get("bucket_id")
         elif name == "buy_yes_lock":
             bucket_id = fire.get("target_bucket_id") or leg.get("bucket_id")
         else:
@@ -1029,6 +1041,9 @@ def _record_fire_event(cfg, state, fire, position, ladlog, now_utc) -> None:
             "direction": fire.get("direction"),
             "jump": fire.get("jump"),
             "ref_source": fire.get("ref_source"),
+            # 入场通道来源（2026-09-12）；既有通道 = target_bucket，新通道 = next_bucket
+            "entry_channel": fire.get("entry_channel"),
+            "next_entry_window": fire.get("next_entry_window"),
             "fills": fill_summary,
             # First-hand evidence for why a fire did not fill: every FAK
             # ladder intent (send_fak / abort_above_cap / no_book /
@@ -1095,6 +1110,8 @@ def record_refire(
                 "ref_source": fire.get("ref_source"),
                 "refire": True,
                 "refire_unfilled": True,
+                "entry_channel": fire.get("entry_channel"),
+                "next_entry_window": fire.get("next_entry_window"),
                 "fills": {},
                 "ladder": [
                     {k: v for k, v in intent.items() if k != "fill"} | ({"fill": intent.get("fill")} if intent.get("fill") else {})
@@ -1194,6 +1211,8 @@ def record_refire(
             "jump": fire.get("jump"),
             "ref_source": fire.get("ref_source"),
             "refire": True,
+            "entry_channel": fire.get("entry_channel"),
+            "next_entry_window": fire.get("next_entry_window"),
             "close_old_yes": close,
             "fills": {
                 str(lg.get("leg")): {"shares": lg.get("shares"), "cost": lg.get("cost_usdc"), "avg": lg.get("avg_price")}
@@ -1206,6 +1225,95 @@ def record_refire(
             "ts_utc": now_utc.isoformat(),
         },
     )
+
+
+def consensus_entry_fire(
+    cfg: dict[str, Any],
+    strat: ConsensusLockStrategy,
+    *,
+    rule_key: str,
+    city: dict[str, Any],
+    rule: dict[str, Any],
+    expected_ref: float | None,
+    taf_extreme_market: float | None,
+    temp: float,
+    market_unit: str | None,
+    entry_res: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    """Build the ``re_fire`` spec for a consensus-lock entry, tagged with its **entry channel**.
+
+    通道（2026-09-12）：
+    - ``target_bucket`` = 既有目标桶通道（腿 ``buy_yes_lock``，窗口 = ``yes_min_ask/yes_max_ask``）。
+    - ``next_bucket``   = 并行"下一档桶廉价入场"通道（腿 ``buy_yes_next``，窗口 = 腿自带
+      ``floor/cap`` = ``next_entry_min_ask/next_entry_max_ask``）。策略先评估，命中即返回。
+
+    预算隔离：新通道 = ``next_entry_budget_pct × fire 预算``；既有通道只用
+    ``strat.target_channel_budget`` 给出的剩余额度（无新通道 fire 时 == fire 预算，逐字不变）。
+    两个通道的腿都自带 ``entry_channel``，端口据此做腿级窗口判定与审计。
+    """
+    from zoneinfo import ZoneInfo  # 本地导入（本模块既有风格）。HEAD 的入口 fire 分支（run_cycle 内）
+    # 引用 ZoneInfo，而该名字只由 TAF 块内的一处 local import 绑定 ⇒ 有 TAF 时能用、**无 TAF
+    # （market_rank1 回退路径）时抛 UnboundLocalError 并中断整轮**。提取到本函数后由此处自行绑定：
+    # 常规（有 TAF）行为不变，无 TAF 时不再炸（详见实现报告"发现"一节）。
+    entry_channel = str(entry_res.get("entry_channel") or CHANNEL_TARGET)
+    fire_budget = Decimal(str(cfg.get("fire_budget_usdc", 15.0)))
+    if entry_channel == CHANNEL_NEXT:
+        pct = Decimal(str(entry_res.get("budget_pct")
+                          or strat.cfg.get("next_entry_budget_pct", "0.5")))
+        channel_budget = (fire_budget * pct).quantize(Decimal("0.01"))
+        entry_legs = [
+            {
+                "leg": NEXT_ENTRY_LEG,
+                "token_id": entry_res["token_id"],
+                "side": "BUY",
+                "outcome": "YES",
+                "cap": str(entry_res.get("cap")),
+                "floor": str(entry_res.get("floor")),
+                "notional_pct": "1.0",
+                "bucket_id": entry_res["bucket_id"],
+                "bucket_lo": entry_res.get("bucket_lo"),
+                "bucket_hi": entry_res.get("bucket_hi"),
+                "bucket_label": entry_res.get("bucket_label"),
+                "entry_channel": CHANNEL_NEXT,
+            }
+        ]
+    else:
+        channel_budget = strat.target_channel_budget(rule_key, fire_budget)
+        entry_legs = [
+            {
+                "leg": "buy_yes_lock",
+                "token_id": entry_res["token_id"],
+                "side": "BUY",
+                "outcome": "YES",
+                "cap": str(entry_res.get("cap", "0.75")),
+                "floor": str(strat.cfg.get("yes_min_ask", "0.45")),
+                "notional_pct": "1.0",
+                "bucket_id": entry_res["bucket_id"],
+                "entry_channel": CHANNEL_TARGET,
+            }
+        ]
+    return {
+        "key": rule_key,
+        "kind": "consensus_lock",
+        "city_id": city["city_id"],
+        "icao": city.get("icao"),
+        "market_local_date": rule.get("market_local_date"),
+        "direction": rule.get("direction"),
+        "ref_extreme": float(expected_ref if expected_ref is not None else temp),
+        "ref_source": "taf" if taf_extreme_market is not None else "market_rank1",
+        "running_extreme": temp,
+        "jump": 0,
+        "target_bucket_id": entry_res["bucket_id"],
+        "local_fire_time": now.astimezone(ZoneInfo(city.get("timezone", "UTC"))).isoformat(),
+        "market_unit": market_unit,
+        "fire_no": 1,
+        "budget_usdc": str(channel_budget),
+        "entry_channel": entry_channel,
+        "next_entry_window": strat.next_entry_window_label(),
+        "legs": entry_legs,
+        "action_type": "re_fire",
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1636,41 +1744,17 @@ def run_cycle(
                 rule_buckets, expected_ref, obs, rule_books, t, now
             )
             if entry_res.get("action") == "execute_taker_fire":
-                fire_action = {
-                    "key": rule_key,
-                    "kind": "consensus_lock",
-                    "city_id": city["city_id"],
-                    "icao": city.get("icao"),
-                    "market_local_date": rule.get("market_local_date"),
-                    "direction": rule.get("direction"),
-                    "ref_extreme": float(expected_ref if expected_ref is not None else temp),
-                    "ref_source": "taf" if taf_extreme_market is not None else "market_rank1",
-                    "running_extreme": temp,
-                    "jump": 0,
-                    "target_bucket_id": entry_res["bucket_id"],
-                    "local_fire_time": now.astimezone(ZoneInfo(city.get("timezone", "UTC"))).isoformat(),
-                    "market_unit": market_unit,
-                    "fire_no": 1,
-                    "budget_usdc": str(cfg.get("fire_budget_usdc", 15.0)),
-                    "legs": [
-                        {
-                            "leg": "buy_yes_lock",
-                            "token_id": entry_res["token_id"],
-                            "side": "BUY",
-                            "outcome": "YES",
-                            "cap": str(entry_res.get("cap", "0.75")),
-                            "floor": str(strat.cfg.get("yes_min_ask", "0.45")),
-                            "notional_pct": "1.0",
-                            "bucket_id": entry_res["bucket_id"],
-                        }
-                    ],
-                    "action_type": "re_fire",
-                }
+                fire_action = consensus_entry_fire(
+                    cfg, strat, rule_key=rule_key, city=city, rule=rule,
+                    expected_ref=expected_ref, taf_extreme_market=taf_extreme_market,
+                    temp=temp, market_unit=market_unit, entry_res=entry_res, now=now,
+                )
                 log_event(log_path, {
                     "type": "fire_attempt",
                     "key": rule_key,
                     "fire_no": 1,
                     "ref_source": fire_action["ref_source"],
+                    "entry_channel": fire_action["entry_channel"],
                     "consensus_meta": entry_res.get("consensus_meta"),
                 })
                 pos_rec, ladlog = _paper_fire(cfg, state, fire_action, now)
@@ -1683,7 +1767,8 @@ def run_cycle(
             else:
                 reason = entry_res.get("reason", "unknown_skip")
                 if reason != "duplicate_obs_time":
-                    log_event(log_path, {"type": "skip", "key": rule_key, "reason": reason})
+                    log_event(log_path, {"type": "skip", "key": rule_key, "reason": reason,
+                                         "next_entry_skip": getattr(strat, "last_next_entry_skip", None)})
             continue
 
         # pass all known books for the whole rule (only YES needed for consensus)

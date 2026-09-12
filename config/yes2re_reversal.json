@@ -11,7 +11,7 @@
   "checkwx_api_key_env": "CHECKWX_API_KEY",
   "base_fee_rate": "0.02",
   "paper_initial_capital_usdc": 700.0,
-  "fire_budget_usdc": 15.0,
+  "fire_budget_usdc": 10.0,
   "max_open_positions": 12,
   "settle_grace_hours": 2,
   "contract_cities_path": "config/contract_cities.json",
@@ -32,13 +32,17 @@
     "entry_mode": "capped_taker",
     "yes_min_ask": "0.45",
     "yes_max_ask": "0.75",
-    "order_budget_usdc": 15.0,
+    "order_budget_usdc": 10.0,
     "early_stop_enabled": true,
     "early_stop_next_bucket_surge": "0.35",
     "early_stop_bid_floor": "0.45",
     "max_fires_per_session": 2,
     "risk_control_no_cap": "0.85",
-    "risk_control_yes_cap": "0.75"
+    "risk_control_yes_cap": "0.75",
+    "next_entry_enabled": true,
+    "next_entry_min_ask": "0.20",
+    "next_entry_max_ask": "0.32",
+    "next_entry_budget_pct": "0.5"
   },
   "strategy": {
     "arm_c": 1.0,

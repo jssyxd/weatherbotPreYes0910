@@ -563,6 +563,15 @@ def average_fill_price(client, order_id: str, *, token_id: str | None = None) ->
 MAKER_ORDER_MODE = "maker"
 TAKER_ORDER_MODE = "taker"
 
+#: entry channels recorded in the audit log (``entry_channel``) — which parallel channel the
+#: order came from.  Stamped from the **dedicated** ``leg_channel`` argument (never from
+#: ``audit_extra``), so a caller-supplied extra cannot spoof or flip the channel of a row.
+#: Kept as a literal copy of ``live/port.py``'s values: v2_transport must stay importable on its
+#: own (port imports *it*, so importing port here would be circular).
+CHANNEL_TARGET = "target_bucket"
+CHANNEL_NEXT = "next_bucket"
+ENTRY_CHANNELS = (CHANNEL_TARGET, CHANNEL_NEXT)
+
 #: which SDK entry point built the order (``order_api`` in the audit log)
 LIMIT_ORDER_API = "limit"
 MARKET_ORDER_API = "market"
@@ -650,7 +659,8 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
                 neg_risk: bool | None = None, gates: dict | None = None, post_only: bool = True,
                 clamp: bool = True, taker: bool = False, cap=None, poll_attempts: int = 6,
                 poll_sleep: float = 1.0, sleep=None, audit_path=None,
-                take_down_unfilled: bool = True, audit_extra: dict | None = None) -> dict:
+                take_down_unfilled: bool = True, audit_extra: dict | None = None,
+                leg_channel: str | None = None, leg_window: str | None = None) -> dict:
     """Place ONE limit order and reconcile the real fill. The submit never retries.
 
     ``gates`` must be a fully-passing gate record (``submit.gate_status``): the dangerous
@@ -678,6 +688,9 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
 
     ``audit_extra`` is merged into the ``intent``/``submit`` audit params so the caller's
     fill-mode decision (``taker_gate`` / ``yes_price`` …) travels with the mandatory record.
+    ``leg_channel`` / ``leg_window`` are stamped **after** that merge — and any same-named value
+    arriving inside ``audit_extra`` is dropped first — so the entry channel recorded for an order
+    can never be spoofed or flipped by a caller-supplied extra.
     """
     out = {"ok": False, "status": "not_started", "order_id": None, "filled_shares": ZERO,
            "avg_price": None, "cost": ZERO, "unfilled": _safe_dec(size), "residual_risk": False,
@@ -792,6 +805,14 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
     params["order_mode"] = out["order_mode"]
     params["order_type"] = out["order_type"]
     params["order_api"] = out["order_api"]
+    # 通道字段同理（2026-09-12）：由**专用入参**盖章，audit_extra 里的同名字段先被剔除 ⇒
+    # 任何调用方都无法伪造/翻转一条审计记录的入场通道来源。只接受已知通道值。
+    params.pop("entry_channel", None)
+    params.pop("leg_window", None)
+    if leg_channel in ENTRY_CHANNELS:
+        params["entry_channel"] = str(leg_channel)
+        if leg_window:
+            params["leg_window"] = str(leg_window)
     if taker:
         # the market-order ``amount`` that actually goes out (USDC for BUY, shares for SELL)
         params["amount"] = out["market_amount"]

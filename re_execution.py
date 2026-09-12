@@ -105,6 +105,8 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
         "shares": str(target_shares),
         "best_ask": str(ask),
         "cap": str(cap),
+        "floor": (str(floor) if floor is not None else None),
+        "entry_channel": leg.get("entry_channel"),
         "extra_ticks": extra,
         "elapsed_ms": elapsed_ms,
         "at_utc": iso_utc(now_utc),

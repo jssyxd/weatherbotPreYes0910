@@ -42,6 +42,13 @@ bucket that is going to zero (observed on 2026-09-11: Toronto YES → 0.001, War
   shows a resting ask; with **no ask** it is skipped as ``no_book``, and with a quote that is
   present but unusable (non-numeric, ``<= 0`` or ``> 1``) it is refused as ``ask_out_of_range``
   rather than mislabelled as an empty book.  It is **never** sent as a passive order either.
+* **YES leg of the parallel next-bucket channel** (``entry_channel == "next_bucket"``, added
+  2026-09-12): judged by the leg's **own** window ``(floor, cap]`` carried on the ladder intent —
+  cfg's ``yes_min_ask``/``yes_max_ask`` cannot move it, and an unusable leg window fails closed
+  (``leg_window_unusable``) instead of being replaced by a band nobody asked for.  Only a leg with
+  **no window at all** falls back to the cfg band.  The decision travels on the audit rows as
+  ``entry_channel`` / ``leg_window`` / ``window_source`` / ``next_entry_window`` (stamped from the
+  port's own leg-derived values, never from a caller-supplied ``audit_extra``).
 * **no passive fallback anywhere on the live path**: whenever a window / cap / book / price
   condition is not met the leg is refused or skipped — a resting ``post_only`` order is never
   produced by ``LivePort.match``.  (``live/v2_transport.execute_leg`` keeps its historical maker
@@ -112,10 +119,20 @@ SKIP = "skip"                   # this leg produced no order at all (refused / n
 GATE_YES_BAND = "yes_band"      # YES leg: its own price inside (yes_min_ask, yes_max_ask]
 GATE_NO_LEG_ASK = "no_leg_ask"  # non-YES leg: a resting ask exists in this leg's own book
 #: YES-leg names in a fire spec — pure data mirror of the strategy's leg names
-YES_LEG_NAMES = ("buy_yes_new", "buy_yes_sleeve", "buy_yes_lock")
+YES_LEG_NAMES = ("buy_yes_new", "buy_yes_sleeve", "buy_yes_lock", "buy_yes_next")
 #: band defaults when cfg carries no yes_min_ask / yes_max_ask
 DEFAULT_YES_MIN_ASK = Decimal("0.48")
 DEFAULT_YES_MAX_ASK = Decimal("0.90")
+
+#: entry channels (audit): the existing target-bucket channel vs the parallel next-bucket one
+CHANNEL_TARGET = "target_bucket"      # 既有目标桶通道（窗口来自 cfg 的 yes_min_ask/yes_max_ask）
+CHANNEL_NEXT = "next_bucket"          # 下一档桶廉价入场通道（窗口来自腿自带的 floor/cap）
+ENTRY_CHANNELS = (CHANNEL_TARGET, CHANNEL_NEXT)
+
+#: where this leg's take window came from (audit) — leg window first, cfg band as the fallback
+WINDOW_SOURCE_LEG = "leg_window"                 # 腿自带窗口（通道自有、独立）
+WINDOW_SOURCE_CFG = "cfg_yes_band"               # 无腿窗口 ⇒ 回退 cfg 的 strategy.yes_min_ask/yes_max_ask
+WINDOW_SOURCE_CFG_FALLBACK = "cfg_yes_band_fallback"
 
 #: machine-readable reasons behind one leg's take/skip decision
 FILL_TAKER = "yes_band"                    # YES leg inside (lo, hi] ⇒ FAK
@@ -126,6 +143,7 @@ FILL_REFUSE_BELOW = "yes_price_below_band"
 FILL_REFUSE_ABOVE = "yes_price_above_band"
 FILL_REFUSE_UNKNOWN = "yes_price_unknown"
 FILL_REFUSE_BAND_BAD = "yes_band_unparsed"
+FILL_REFUSE_LEG_WINDOW = "leg_window_unusable"   # 腿自带窗口缺失/非法 ⇒ 弃单（绝不回退、绝不降级）
 FILL_REFUSE_NO_CAP = "taker_cap_missing"   # no explicit, usable cap ⇒ refuse (L-2)
 
 ONE = Decimal("1")
@@ -264,6 +282,108 @@ def _yes_leg_of(fire: dict) -> dict:
         if is_yes_leg(leg):
             return leg
     return {}
+
+
+def leg_entry_channel(leg: dict | None, fire: dict | None = None) -> str | None:
+    """This leg's entry channel, from the leg itself first, then its own fire row (pure).
+
+    ``entry_channel`` is written by the strategy on the *fire* and its legs and travels
+    unchanged onto the ladder intent.  A leg that declares nothing (every legacy fire) is
+    simply "no channel": the caller then keeps the historical cfg-band behaviour.  Only the
+    two known channels are ever reported, so a corrupt value can never masquerade as one.
+    """
+    for value in ((leg or {}).get("entry_channel"), (fire or {}).get("entry_channel")):
+        if value and str(value) in ENTRY_CHANNELS:
+            return str(value)
+    name = str((leg or {}).get("leg") or "")
+    for row in (fire or {}).get("legs") or []:
+        if not isinstance(row, dict) or str(row.get("leg")) != name:
+            continue
+        if row.get("entry_channel") and str(row["entry_channel"]) in ENTRY_CHANNELS:
+            return str(row["entry_channel"])
+    return None
+
+
+def _leg_window_bounds(leg: dict | None, fire: dict | None) -> tuple[Any, Any]:
+    """The raw ``(floor, cap)`` a YES leg carries — the leg (ladder intent) first, else its fire row.
+
+    A fire carries no window of its own: the legs are judged one by one.  The fire's own leg spec
+    is only consulted for a field the intent did not carry, and always matched **by leg name**.
+    """
+    leg = leg if isinstance(leg, dict) else {}
+    lo_raw = leg.get("floor")
+    hi_raw = leg.get("cap")
+    if lo_raw is not None and hi_raw is not None:
+        return lo_raw, hi_raw
+    name = str(leg.get("leg") or "")
+    for row in (fire or {}).get("legs") or []:
+        if not isinstance(row, dict) or str(row.get("leg")) != name:
+            continue
+        return (lo_raw if lo_raw is not None else row.get("floor"),
+                hi_raw if hi_raw is not None else row.get("cap"))
+    return lo_raw, hi_raw
+
+
+def leg_window_number(value) -> tuple[Decimal | None, str]:
+    """Parse one leg-window bound ⇒ ``(value, state)`` with ``state in {"ok","absent","bad"}``.
+
+    An empty/``None``/zero floor means "no lower bound" (``ok`` with ``None``) — the leg simply
+    does not clamp from below.  Anything unparseable, non-finite, negative or ``> 1`` is ``bad``
+    and the caller **fails closed**: a corrupt leg window must never be silently replaced by the
+    cfg band (that would be a downgrade to a window nobody asked for).
+    """
+    if value is None or isinstance(value, bool):
+        return None, "absent"
+    text = str(value).strip()
+    if text in ("", "None"):
+        return None, "absent"
+    try:
+        out = Decimal(text)
+    except (InvalidOperation, AttributeError, ValueError):
+        return None, "bad"
+    if not out.is_finite() or out < ZERO or out > ONE:
+        return None, "bad"
+    return (out if out > ZERO else None), "ok"
+
+
+def leg_take_window(leg: dict | None, fire: dict | None, cfg: dict | None) -> dict:
+    """The window this leg's take is judged against: ``(lo, hi]``.
+
+    Leg-level rule (operator instruction 2026-09-12, extended 2026-09-12 to the parallel
+    next-bucket channel): a YES leg belonging to the **next-bucket** channel carries its **own**
+    window in ``floor``/``cap`` and is judged by *that* window only — cfg's
+    ``yes_min_ask``/``yes_max_ask`` cannot move it, and an unusable leg window fails closed
+    (``leg_window_unusable``) instead of falling back to a band nobody asked for.  A leg with
+    **no window at all** falls back to the cfg band (the documented fallback).
+
+    Every other leg (the existing target-bucket channel, sleeves, refires, the reversal
+    strategy, and the whole historical test surface) keeps the cfg band **exactly** as before:
+    ``yes_price_band(cfg)`` — the same call, the same reason code, the same source label.
+
+    Returns ``{ok, lo, hi, detail, source, channel, reason}`` where ``reason`` is the
+    machine-readable refusal when ``ok`` is ``False``.  Pure: reads nothing but its arguments.
+    """
+    channel = leg_entry_channel(leg, fire)
+    if channel != CHANNEL_NEXT:
+        band = yes_price_band(cfg)
+        return {**band, "source": WINDOW_SOURCE_CFG, "channel": channel,
+                "reason": FILL_REFUSE_BAND_BAD}
+    lo_raw, hi_raw = _leg_window_bounds(leg, fire)
+    if lo_raw is None and hi_raw is None:
+        band = yes_price_band(cfg)               # 无腿窗口 ⇒ 回退 cfg（规范允许的唯一回退）
+        return {**band, "source": WINDOW_SOURCE_CFG_FALLBACK, "channel": channel,
+                "reason": FILL_REFUSE_BAND_BAD}
+    lo, lo_state = leg_window_number(lo_raw)
+    hi, hi_state = leg_window_number(hi_raw)
+    if lo_state == "bad" or hi_state == "bad" or hi is None or (lo is not None and lo >= hi):
+        return {"ok": False, "lo": None, "hi": None, "channel": channel,
+                "source": WINDOW_SOURCE_LEG, "reason": FILL_REFUSE_LEG_WINDOW,
+                "detail": (f"leg window unusable (floor={lo_raw!r}, cap={hi_raw!r}; need "
+                           f"0 <= floor < cap <= 1) — refuse, no order sent "
+                           f"(never a fallback to the cfg band, never a passive order)")}
+    return {"ok": True, "lo": (lo if lo is not None else ZERO), "hi": hi, "channel": channel,
+            "source": WINDOW_SOURCE_LEG,
+            "detail": f"({lo if lo is not None else ZERO}, {hi}]", "reason": REASON_OK}
 
 
 def yes_leg_price(fire: dict | None, *, leg: dict | None = None) -> dict:
@@ -503,12 +623,13 @@ class LivePort(ExecutionPort):
         """
         fire = fire if isinstance(fire, dict) else {}
         leg = leg if isinstance(leg, dict) else {}
-        band = yes_price_band(cfg)
+        band = leg_take_window(leg, fire, cfg)
         is_yes = is_yes_leg(leg)
         gate = GATE_YES_BAND if is_yes else GATE_NO_LEG_ASK
         base = {"taker": False, "order_mode": SKIP, "taker_gate": gate,
                 "yes_price": None, "source": "n/a", "cap": None,
-                "lo": band["lo"], "hi": band["hi"], "leg": leg.get("leg")}
+                "lo": band["lo"], "hi": band["hi"], "leg": leg.get("leg"),
+                "entry_channel": band.get("channel"), "window_source": band.get("source")}
         cap = taker_cap_number(leg.get("cap"))
         if cap is None:
             return {**base, "reason": FILL_REFUSE_NO_CAP,
@@ -516,7 +637,7 @@ class LivePort(ExecutionPort):
                                f"(cap={leg.get('cap')!r}; need 0 < cap <= 1) — refuse")}
         base["cap"] = cap
         if not band["ok"]:
-            return {**base, "reason": FILL_REFUSE_BAND_BAD, "source": "cfg_yes_band",
+            return {**base, "reason": band["reason"], "source": band["source"],
                     "detail": band["detail"]}
         quote = ask_state_of(book)
         if not quote["present"]:
@@ -571,10 +692,19 @@ class LivePort(ExecutionPort):
                     "status": "live_not_preflighted", "source": LIVE,
                     "detail": "preflight must run before any order"}
         ctx = self.fill_mode(fire=fire, leg=leg, cfg=cfg, book=book, client=client)
+        #: the window the decision was actually judged against, as a readable label (audit).
+        leg_window = (f"({ctx['lo']}, {ctx['hi']}]"
+                      if ctx.get("lo") is not None and ctx.get("hi") is not None else None)
         audit_extra = {"taker_gate": ctx["taker_gate"], "taker_gate_ok": ctx["taker"],
                        "yes_price": str(ctx["yes_price"]) if ctx["yes_price"] is not None else None,
                        "yes_price_source": ctx["source"], "fill_mode": ctx["reason"],
-                       "leg": leg.get("leg")}
+                       "leg": leg.get("leg"),
+                       # 通道来源（端口从腿/fire 推导的权威值；下面 execute_leg 会再盖章一次，
+                       # 外部 audit_extra 无法伪造或翻转）
+                       "entry_channel": ctx.get("entry_channel"),
+                       "leg_window": leg_window,
+                       "window_source": ctx.get("window_source"),
+                       "next_entry_window": (fire or {}).get("next_entry_window")}
         if not ctx["taker"]:
             # take-or-nothing: a leg that is out of band / uncapped / unpriced / has no book is
             # dropped here.  No order of ANY kind is sent — the historical passive fallback is gone.
@@ -582,7 +712,8 @@ class LivePort(ExecutionPort):
                     "status": ctx["reason"], "order_id": None, "residual_risk": False,
                     "limit_price": None, "clamped": False, "detail": ctx["detail"],
                     "order_mode": SKIP, "taker_gate": ctx["taker_gate"],
-                    "yes_price": ctx["yes_price"], "fill_and_kill": False, "source": LIVE}
+                    "yes_price": ctx["yes_price"], "fill_and_kill": False, "source": LIVE,
+                    "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window}
         token_id = leg.get("token_id")
         neg_risk, neg_src = self.resolve_neg_risk(client, token_id, book)
         if neg_risk is None:
@@ -593,7 +724,8 @@ class LivePort(ExecutionPort):
                     "limit_price": None, "clamped": False, "source": LIVE,
                     "detail": "neg-risk signing domain unknown; refusing to sign a mis-scoped order",
                     "order_mode": SKIP, "neg_risk_source": neg_src,
-                    "yes_price": ctx["yes_price"], "fill_and_kill": False}
+                    "yes_price": ctx["yes_price"], "fill_and_kill": False,
+                    "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window}
         result = self.transport.execute_leg(
             client,
             token_id=str(token_id),
@@ -612,6 +744,10 @@ class LivePort(ExecutionPort):
             poll_sleep=self.poll_sleep,
             sleep=self.sleep,
             audit_path=self.audit_path,
+            # 通道字段走**专用入参**（不是 audit_extra）：execute_leg 在合并完 audit_extra 之后
+            # 用它盖章，因此调用方塞进 audit_extra 的 entry_channel/leg_window 一律被剔除 ⇒ 不可伪造。
+            leg_channel=ctx.get("entry_channel"),
+            leg_window=leg_window,
             audit_extra={**audit_extra, "neg_risk": bool(neg_risk), "neg_risk_source": neg_src},
         )
         return {"filled_shares": result.get("filled_shares") or ZERO,
@@ -628,6 +764,7 @@ class LivePort(ExecutionPort):
                 "taker_gate": ctx["taker_gate"],
                 "yes_price": ctx["yes_price"],
                 "fill_and_kill": bool(result.get("fill_and_kill")),
+                "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window,
                 "source": LIVE}
 
     def describe(self) -> dict:
@@ -636,7 +773,11 @@ class LivePort(ExecutionPort):
                 "gates": self.gates.get("checks"), "limits": self.limits,
                 "order_modes": [TAKER, SKIP], "passive_fallback": False,
                 "taker_gates": [GATE_YES_BAND, GATE_NO_LEG_ASK],
-                "taker_scope": "leg_level_independent", "yes_legs": list(YES_LEG_NAMES)}
+                "taker_scope": "leg_level_independent", "yes_legs": list(YES_LEG_NAMES),
+                "entry_channels": list(ENTRY_CHANNELS),
+                "next_entry_window_rule": ("entry_channel == 'next_bucket' ⇒ 腿自带 (floor, cap] "
+                                           "窗口生效，cfg 的 yes_min_ask/yes_max_ask 不动它；"
+                                           "无腿窗口才回退 cfg")}
 
 
 def _slim(account: dict) -> dict:
