@@ -1,5 +1,93 @@
 # Changelog — weatherbotPreYes0910
 
+## 2026-09-12 — F-A 预算基数统一 + 审计字段（无 TAF 暴露面可量化）+ 5 条 LOW 清扫
+
+依据 `/tmp/preyes_next_bucket_audit_report.md` §5（F-A MEDIUM / F-B..F-F LOW / F-G..F-I INFO）与
+`/tmp/preyes_fa_low_spec.md`。**未改动任何策略阈值 / 门序 / 窗口语义**；**paper 回归逐字不变**
+（`3d16632c458bb969…`）；10 套件全绿；零真实订单（全部 paper/stub）。
+
+### 1) F-A（MEDIUM）统一预算基数 —— 唯一基数 = **生效 fire 预算**
+
+- **根因**：新通道把"已占用额度"记成 `order_budget_usdc × pct`（config 15.0 / 现 10.0），
+  而引擎按 `fire_budget_usdc × pct`（可被 `YES2RE_FIRE_BUDGET_USDC` 覆盖）实际发单 ⇒ 基数不等时
+  (i) fire < 旧基数 ⇒ 既有通道被静默少给 `(旧基数 − fire) × pct`；(ii) fire > 旧基数 ⇒
+  `新通道 + 既有通道` 可越界（审计实测 15.0 + 22.5 = 37.5 > 30）。
+- **修法**：`_r_cycle._get_consensus_lock_strat` 把**生效的 fire 预算**注入策略 cfg
+  （取数写成与 `_paper_fire` 逐字同源的 `cfg.get("fire_budget_usdc", DEFAULTS[...])`，位于两次 merge
+  之后 ⇒ 旧配置无法覆盖）；策略新增唯一基数解析器 `ConsensusLockStrategy.order_budget()`
+  （优先 `fire_budget_usdc`；缺失时回退**已废弃**键 `order_budget_usdc`，再缺省 15.0），
+  `strategy_consensus_lock.py` 的两处 sizing 改用该解析器（`:496` `(基数 × pct).quantize(0.01)`、
+  `:688` 基数本身，数学逐字保留）。`DEFAULT_CONFIG.order_budget_usdc` 与 `DEPLOY_RUNBOOK.md` §7.3.1
+  已标注**废弃**，"部署时必须手工对齐两个基数"的前置条件**从此取消**。
+- **证据**：`tests_consensus_lock.py::test_budget_base_unified_fire_budget` 对
+  fire ∈ {5,10,12,15,30,50} × pct ∈ {0.5,0.0,1.0}（18 组）断言
+  `新通道预算 + 既有通道剩余 ≤ fire`、两者 ≥ 0、**计划名义额合计 ≤ fire**，并实证旧基数在
+  fire>15 时必然越界、fire<15 时静默少给；
+  `tests_cycle_consensus_lock.py::test_engine_budget_base_injected_from_effective_fire_budget`
+  以真实 `consensus_entry_fire` 断言两通道预算**合计 == fire**（策略侧记账 == 引擎侧预算）。
+- **行为影响**：现行 config（fire=10、order=10）下**数值零变化**；仅当 env 覆盖 fire 预算时才与
+  旧行为不同（且新行为正是操作者意图：两通道随 fire 一起缩放）。
+
+### 2) 审计字段：让"无 TAF 暴露面"可量化（纯追加，行为零变化）
+
+- 入口 fire / 入口 refire / 破位反手·追火的 `fire`、`fire_attempt`、`breach_risk_control` 事件行
+  追加 **`taf_present`(bool) / `taf_source`("taf"|"market_rank1") / `fire_path`("entry"|"hedge"|"refire")
+  / `fire_key`(str)**。实现为 `_r_cycle.taf_audit_fields()`（纯函数、**绝不抛异常**，异常兜底返回保守值），
+  `_record_fire_event` / `record_refire` 新增**关键字可选**入参（省略时从 fire 自身推导）
+  ⇒ 既有调用方（paper sim、反转车道）逐字不变，`hedge_fire` 字典本身**一个键都没加**
+  （F2 的 golden 用例继续逐字通过）。
+- **查询模板**：`scripts/taf_exposure_stats.py`（stdlib）按 `(fire_path × taf_present)` 计数，
+  直接输出"对冲路径中 `taf_present=False` 的次数"；对旧行（无字段）与撕裂行容错。
+  实测：入口/对冲 × 有/无 TAF 四组合日志 → `fire_path=hedge 总=6 taf_present=False=3`，
+  旧格式行被计为"缺追加字段"而不报错。
+- **测试**：`tests_breach_hedge.py` 新增两例（对冲路径用真实 `run_cycle` + 真实 paper 填充与
+  `record_refire`；入口路径用真实 `evaluate_entry`/`consensus_entry_fire`/`_record_fire_event`
+  + 预置 rank-1 tracker），断言四组合下 4 字段存在且取值正确（无 TAF ⇒ `taf_present=False`、
+  `taf_source="market_rank1"`；入口行 `taf_source` 与既有 `ref_source` 逐字一致）。
+
+### 3) LOW 清扫
+
+- **F-B/F-C（审计字段不可伪造）**：`live/v2_transport.execute_leg` 在函数入口把 9 个"不可伪造"键
+  （`order_api` / `amount` / `amount_unit` / `entry_channel` / `leg_window` / `window_source` /
+  `next_entry_window` / `neg_risk` / `neg_risk_source`）从 `audit_extra` **统一剔除**，
+  再由本层计算值或专用入参盖章（新增 `leg_window_source` / `leg_next_entry_window` / `neg_risk_source`
+  专用入参；缺失 ⇒ 该键不出现，绝不落调用方的值）；`live/port.py::match` 改走专用入参。
+  ⇒ **5 条 early-deny 路径的 deny 行不再带走注入值**（此前"哪条通道被拒"可被伪造）。
+  测试：`tests_port.py::test_v2_transport_unforgeable_audit_keys`（taker/maker/白名单外 + 5 条 deny）。
+- **F-D（`min_order_size`）—— 结论：引擎 fire 路径**未检查**（全仓唯一强制点 `live/order_plan.py:225`
+  只被 smoke/sign_dryrun 调用）⇒ 按 SPEC 加 **fail-closed 本地守卫**：新增
+  `LivePort.match` 在计划股数 < 该腿 book 的 `min_order_size` 时**本地弃单**
+  （`order_mode=skip`、`status=below_min_order_size`、**零发单**、reason 写进 `detail`，
+  book 未给出该字段 ⇒ 不新增拒单，行为与以前逐字相同；`describe()["local_refusals"]` 广告该拒单）。
+  测试：`tests_port.py::test_live_match_below_min_order_size_local_refusal`（4.9 弃 / 5.0 放 / 5.1 放）。
+- **F-E（文档不变量）**：`live/port.py::fill_mode` docstring 与模块 docstring 按实现写实 ——
+  "坏 cfg 窗口 ⇒ 整笔 fire 停摆"对**带自有窗口的新通道腿已不成立**（该腿只受自身 fail-closed
+  窗口约束，绝不回退）；只有"无腿窗口"的既有腿仍由 cfg band 管辖（非法 ⇒ `yes_band_unparsed` 拒）。
+- **F-F（腿→桶映射契约）**：`tests_cycle_consensus_lock.py::test_leg_to_bucket_mapping_contract`
+  把该映射行为固定下来：fire 侧键优先（`broken_bucket_id` / `target_bucket_id` / `new_bucket_id`）、
+  `new_bucket_id` 为空串/缺失 ⇒ 退回腿自带 `bucket_id`（审计回归实证的 `'' → 'B2'`）、其它腿名保持原值。
+
+### 4) 已知影响面 / 风险（如实记录）
+
+- **审计行**：既有腿（不带通道字段）的 intent 行现在**不再出现** `entry_channel: None` /
+  `next_entry_window: None`（改为该键缺席）；非法/缺失值不再可能出现在 deny 行。属审计字段收紧。
+- **live 小额腿**：F-D 守卫会让"计划股数 < venue 最小下单量"的腿在本地弃单（最可能是
+  `sleeve_notional_pct` 很小的小单，生产 config `sleeve_enabled=false`）。paper 路径不受影响
+  （paper 无 venue 最小量，且必须逐字不变）。若 book 未提供 `min_order_size`，守卫不生效
+  （残留风险：venue 不报该字段时仍可能发小单被拒 —— 已在 docstring/报告标注）。
+- **未修（保持原状）**：F-G/F-H/F-I（INFO）；F-H（破位反手分支无 TAF 的行为）已由 HEAD 4ca3397 修复。
+- 不 commit / 不 push（本次仅工作区改动）。
+
+### 验证
+
+```
+10 套件（全部 exit 0）: tests_consensus_lock 16/16 · tests_cycle_consensus_lock 6 用例 ·
+tests_breach_hedge 5 用例 · tests_port 35/35 · tests_live 51/51 · tests_fill_gate 6 ·
+tests_reversal 24 · tests_sleeve_signal 13 · tests_sleeve_wiring 4 · tests_market_adapter 4
+paper 回归: python3 paper_reversal_sim.py --scenarios-only | sha256sum
+           = 3d16632c458bb969dd9dd379fd8e3d03df767e9d1827e1c05ba20e03945b0c2c   （与基线逐字一致）
+```
+
 ## 2026-09-12 — 修复 F2：破位反手/追火分支的 `ZoneInfo` 未绑定（`UnboundLocalError` 中断整轮）
 
 **缺陷（代码 + 实证双确认）**：`_r_cycle.py::run_cycle()` 的破位反手/追火分支构造 `hedge_fire` 时使用

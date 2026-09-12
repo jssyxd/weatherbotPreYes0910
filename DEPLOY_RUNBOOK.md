@@ -149,12 +149,20 @@ WantedBy=multi-user.target
 | 变量 | 覆盖 | 说明 |
 |------|------|------|
 | `YES2RE_MODE` | `cfg['mode']` | `paper` \| `live`；非法值 → 启动即 `SystemExit`（fail-closed，不静默忽略） |
-| `YES2RE_FIRE_BUDGET_USDC` | `cfg['fire_budget_usdc']` | 每笔 fire 预算；有限正数 |
+| `YES2RE_FIRE_BUDGET_USDC` | `cfg['fire_budget_usdc']` | 每笔 fire 预算；有限正数。**这也是策略侧 sizing 的唯一基数**（F-A 2026-09-12，见下） |
 | `YES2RE_MAX_OPEN_POSITIONS` | `cfg['max_open_positions']` | 同时持仓上限；正整数 |
 | `YES2RE_INITIAL_CAPITAL_USDC` | `cfg['paper_initial_capital_usdc']` | **实盘实例填真实账户余额**，使账本/权益以真实资金起算；有限正数 |
 
 未设置时 `load_config` 输出与改动前逐字段一致；覆盖后 `_validate_config`（间隔/金额/模式）照常校验。
 策略参数（`strategy` 子字典）**永远**来自共用的 config 文件，环境变量无法触及。
+
+> **F-A（2026-09-12，已修）：`YES2RE_FIRE_BUDGET_USDC` 是唯一预算基数。**
+> 引擎在构造策略时把**生效的** fire 预算注入策略 cfg（`_r_cycle._get_consensus_lock_strat`），
+> 策略侧 sizing（`ConsensusLockStrategy.order_budget()`）优先读它；config 里
+> `consensus_lock.order_budget_usdc` 降级为**已废弃**的兼容回退（仅在 fire 预算缺失时生效）。
+> 因此"下一档桶通道 + 既有目标桶通道 ≤ fire 预算"的不变量对**任意** env 取值都成立，
+> 部署时**不再需要**手工把 `order_budget_usdc` 与 env 对齐（对齐仍然无害）。
+> 若把 env 调小/调大，两通道额度会随它一起缩放，不再出现"既有通道被静默少给"或"合计越界"。
 
 ### 7.4 观测镜像（复用**同一套**观察脚本与 cron）
 

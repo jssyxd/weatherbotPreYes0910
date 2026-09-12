@@ -572,6 +572,17 @@ CHANNEL_TARGET = "target_bucket"
 CHANNEL_NEXT = "next_bucket"
 ENTRY_CHANNELS = (CHANNEL_TARGET, CHANNEL_NEXT)
 
+#: 审计行里**不可伪造**的键（F-B/F-C，2026-09-12）。它们描述"这笔单事实上是什么"
+#: （走的哪条 API/多少钱/哪条通道/哪个窗口/哪个签名域），因此**只能由本模块的计算值或专用入参
+#: 盖章**：调用方通过 ``audit_extra`` 传进来的同名键一律先剔除，绝不覆盖权威值，也绝不出现在
+#: ``deny`` 行里（此前 5 条 early-deny 路径会把调用方注入的 ``entry_channel``/``leg_window``
+#: 原样带走 ⇒ 审计日志里"哪条通道被拒"可被伪造；生产链路上端口自己算，故无实害）。
+SPOOFABLE_AUDIT_KEYS = (
+    "order_api", "amount", "amount_unit",
+    "entry_channel", "leg_window", "window_source", "next_entry_window",
+    "neg_risk", "neg_risk_source",
+)
+
 #: which SDK entry point built the order (``order_api`` in the audit log)
 LIMIT_ORDER_API = "limit"
 MARKET_ORDER_API = "market"
@@ -660,7 +671,9 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
                 clamp: bool = True, taker: bool = False, cap=None, poll_attempts: int = 6,
                 poll_sleep: float = 1.0, sleep=None, audit_path=None,
                 take_down_unfilled: bool = True, audit_extra: dict | None = None,
-                leg_channel: str | None = None, leg_window: str | None = None) -> dict:
+                leg_channel: str | None = None, leg_window: str | None = None,
+                leg_window_source: str | None = None, leg_next_entry_window: str | None = None,
+                neg_risk_source: str | None = None) -> dict:
     """Place ONE limit order and reconcile the real fill. The submit never retries.
 
     ``gates`` must be a fully-passing gate record (``submit.gate_status``): the dangerous
@@ -688,9 +701,13 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
 
     ``audit_extra`` is merged into the ``intent``/``submit`` audit params so the caller's
     fill-mode decision (``taker_gate`` / ``yes_price`` …) travels with the mandatory record.
-    ``leg_channel`` / ``leg_window`` are stamped **after** that merge — and any same-named value
-    arriving inside ``audit_extra`` is dropped first — so the entry channel recorded for an order
-    can never be spoofed or flipped by a caller-supplied extra.
+    ``entry_channel`` / ``leg_window`` / ``window_source`` / ``next_entry_window`` and the
+    ``neg_risk`` signing-domain pair — plus the computed ``order_api`` / ``amount`` /
+    ``amount_unit`` — are **unforgeable** (F-B/F-C, 2026-09-12): every same-named key arriving
+    inside ``audit_extra`` is dropped **first** (so it can neither overwrite the authoritative
+    value nor ride along on an early ``deny`` row), and the authoritative value is then stamped
+    from this module's own computation or from the dedicated arguments.  A key whose dedicated
+    argument is absent is simply *not* recorded — never the caller's value.
     """
     out = {"ok": False, "status": "not_started", "order_id": None, "filled_shares": ZERO,
            "avg_price": None, "cost": ZERO, "unfilled": _safe_dec(size), "residual_risk": False,
@@ -711,6 +728,11 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
         return {**out, "status": "invalid_input", "detail": str(exc)}
 
     extra_params: dict[str, Any] = dict(audit_extra or {})
+    # 不可伪造字段（F-B/F-C，2026-09-12）：先于一切使用**剔除**调用方注入的同名键 —— 包括下面
+    # 每条 early-deny 行的 ``_deny_audit(..., {**extra_params, ...})``。权威值只在下面按计算值/
+    # 专用入参重新盖章（缺失 ⇒ 该键不出现，绝不落调用方的值）。
+    for _spoofable in SPOOFABLE_AUDIT_KEYS:
+        extra_params.pop(_spoofable, None)
     #: the market-order ``amount`` (USDC for BUY / shares for SELL).  Assigned by the taker branch
     #: below — which returns *before* any signing if the amount would not be representable, so a
     #: taker order can never reach the call site with the placeholder value.
@@ -805,14 +827,20 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
     params["order_mode"] = out["order_mode"]
     params["order_type"] = out["order_type"]
     params["order_api"] = out["order_api"]
-    # 通道字段同理（2026-09-12）：由**专用入参**盖章，audit_extra 里的同名字段先被剔除 ⇒
-    # 任何调用方都无法伪造/翻转一条审计记录的入场通道来源。只接受已知通道值。
-    params.pop("entry_channel", None)
-    params.pop("leg_window", None)
+    # 通道/窗口/签名域同理（2026-09-12，F-B/F-C）：全部由**专用入参**盖章（``audit_extra`` 里的
+    # 同名键已在函数入口被剔除）⇒ 任何调用方都无法伪造/翻转一条审计记录的来源。只接受已知通道值。
     if leg_channel in ENTRY_CHANNELS:
         params["entry_channel"] = str(leg_channel)
         if leg_window:
             params["leg_window"] = str(leg_window)
+    if leg_window_source is not None:
+        params["window_source"] = str(leg_window_source)
+    if leg_next_entry_window is not None:
+        params["next_entry_window"] = str(leg_next_entry_window)
+    if neg_risk is not None:
+        params["neg_risk"] = bool(neg_risk)
+    if neg_risk_source is not None:
+        params["neg_risk_source"] = str(neg_risk_source)
     if taker:
         # the market-order ``amount`` that actually goes out (USDC for BUY, shares for SELL)
         params["amount"] = out["market_amount"]

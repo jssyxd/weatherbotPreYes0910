@@ -60,6 +60,14 @@ def _get_consensus_lock_strat(cfg: dict[str, Any]) -> ConsensusLockStrategy:
     global _CONSENSUS_LOCK_STRAT
     if _CONSENSUS_LOCK_STRAT is None:
         merged_cfg = {**(cfg.get("strategy") or {}), **(cfg.get("consensus_lock") or {})}
+        # F-A（2026-09-12，审计 MEDIUM）：把**生效的 fire 预算**注入策略 cfg —— 从此策略侧的
+        # sizing 基数与"新通道已占用额度"只有一个来源。取数写成与 ``_paper_fire`` 逐字同源的
+        # 表达式（``cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"])``），因此它已经
+        # 含 ``YES2RE_FIRE_BUDGET_USDC`` env 覆盖并由 ``_r_state.load_config`` 校验过。
+        # 注入放在两次 merge **之后** ⇒ ``consensus_lock.fire_budget_usdc`` 之类的旧配置无法
+        # 覆盖生效值（唯一基数 = 引擎真正要发的钱）。策略仍保留废弃键 ``order_budget_usdc``
+        # 作为缺失时的回退（见 ``ConsensusLockStrategy.order_budget``）。
+        merged_cfg["fire_budget_usdc"] = cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"])
         _CONSENSUS_LOCK_STRAT = ConsensusLockStrategy(merged_cfg)
     return _CONSENSUS_LOCK_STRAT
 
@@ -87,6 +95,68 @@ _LAST_GOOD_TAF: dict[str, dict[str, Any]] = {}
 # 5s cadence — logging all of them would add ~98 lines/cycle to the JSONL).
 _DUP_LOG: dict[str, float] = {}
 _DUP_LOG_INTERVAL_S = 300.0
+
+
+# --------------------------------------------------------------------------- #
+# 审计字段（2026-09-12，纯追加）：让"无 TAF 暴露面"可量化
+# --------------------------------------------------------------------------- #
+#: fire 的**路径**标签 —— 与 ``action_type``（只说"这是一次 fire"）不矛盾，互为补充
+FIRE_PATH_ENTRY = "entry"      # 入口 fire（新开仓：目标桶通道 / 下一档桶通道 / 反转策略首火）
+FIRE_PATH_HEDGE = "hedge"      # 破位反手 / 追火（METAR hard-breach hedge fire）
+FIRE_PATH_REFIRE = "refire"    # 入口车道上的第二次 fire（同会话追火，fire_no >= 2）
+
+
+def resolve_fire_path(fire: Any, override: str | None = None) -> str:
+    """fire 的路径标签（审计）。**永不抛异常**：畸形/缺失 ⇒ 按 ``fire_no`` 保守推断。"""
+    if override:
+        return str(override)
+    f = fire if isinstance(fire, dict) else {}
+    try:
+        if str(f.get("ref_source") or "") == "metar_breach_hedge":
+            return FIRE_PATH_HEDGE
+        return FIRE_PATH_REFIRE if int(f.get("fire_no") or 1) >= 2 else FIRE_PATH_ENTRY
+    except Exception:  # noqa: BLE001 — 审计字段绝不允许成为新的失败点
+        return FIRE_PATH_ENTRY
+
+
+def resolve_taf_present(fire: Any, taf_extreme_market: Any = None) -> bool:
+    """该站在**本次评估**时是否有可用 TAF（即走 TAF 极值分支还是 market_rank1 回退）。
+
+    优先用调用方给的显式证据（``run_cycle`` 的 ``taf_extreme_market is not None``：非 ``None``
+    就说明该站本次有同日的可用 TAF 极值）；未提供时退回 fire 自身的
+    ``ref_source == "taf"``（``consensus_entry_fire`` 用的同一判定，语义同源）。纯函数。
+    """
+    if taf_extreme_market is not None:
+        return True
+    f = fire if isinstance(fire, dict) else {}
+    return str(f.get("ref_source") or "") == "taf"
+
+
+def taf_audit_fields(fire: Any, *, fire_path: str | None = None,
+                     taf_extreme_market: Any = None) -> dict[str, Any]:
+    """纯追加的 4 个审计字段（**不改变任何判定/阈值/state**）：
+
+    - ``taf_present``  bool —— 本次评估该站是否有可用 TAF（``True`` ⇒ 走的 TAF 极值分支）
+    - ``taf_source``   str  —— ``"taf"`` / ``"market_rank1"``（与既有 ``ref_source`` 同源语义）
+    - ``fire_path``    str  —— ``"entry"`` / ``"hedge"`` / ``"refire"``
+    - ``fire_key``     str  —— 该 fire 的会话 key（事件可能已有 ``key``，此处以 ``fire_key`` 同值冗余）
+
+    字段缺失/畸形时**绝不抛异常**（``log_event`` 路径不得引入新的失败点）：最坏情况返回
+    保守值（``taf_present=False`` / ``market_rank1``）。调用方用 ``**taf_audit_fields(...)``
+    合并进既有事件字典 ⇒ 行为零变化，只是多了 4 个可统计的键。
+    """
+    try:
+        present = resolve_taf_present(fire, taf_extreme_market)
+        return {
+            "taf_present": bool(present),
+            "taf_source": "taf" if present else "market_rank1",
+            "fire_path": resolve_fire_path(fire, fire_path),
+            "fire_key": (fire or {}).get("key") if isinstance(fire, dict) else None,
+        }
+    except Exception:  # noqa: BLE001 — 审计字段是纯附加物：出问题也不能让 fire 路径失败
+        return {"taf_present": False, "taf_source": "market_rank1",
+                "fire_path": str(fire_path or FIRE_PATH_ENTRY), "fire_key": None}
+
 
 # taf_no_extreme events throttled per ICAO (~10min): a TAF that carries no
 # TX/TN is the silent reason a city has no TAF reference (and would fall back
@@ -1014,7 +1084,15 @@ def _paper_fire(
     return position, ladlog
 
 
-def _record_fire_event(cfg, state, fire, position, ladlog, now_utc) -> None:
+def _record_fire_event(cfg, state, fire, position, ladlog, now_utc, *,
+                       fire_path: str | None = None, taf_extreme_market: Any = None) -> None:
+    """Ledger + ``fire`` audit row for an entry-lane fire.
+
+    ``fire_path`` / ``taf_extreme_market`` are **pure audit additions** (2026-09-12): they only
+    decide the 4 appended keys (``taf_present`` / ``taf_source`` / ``fire_path`` / ``fire_key``).
+    Omitting them derives the same values from ``fire`` itself, so every existing caller
+    (paper sim / reversal lane) keeps its behaviour byte for byte.
+    """
     ensure_re_state(state)
     legs = position.get("legs") or []
     fill_summary = {
@@ -1044,6 +1122,8 @@ def _record_fire_event(cfg, state, fire, position, ladlog, now_utc) -> None:
             # 入场通道来源（2026-09-12）；既有通道 = target_bucket，新通道 = next_bucket
             "entry_channel": fire.get("entry_channel"),
             "next_entry_window": fire.get("next_entry_window"),
+            # 审计追加（2026-09-12，纯加法）：TAF 存在性 + 路径 + fire key（统计"无 TAF 暴露面"）
+            **taf_audit_fields(fire, fire_path=fire_path, taf_extreme_market=taf_extreme_market),
             "fills": fill_summary,
             # First-hand evidence for why a fire did not fill: every FAK
             # ladder intent (send_fak / abort_above_cap / no_book /
@@ -1064,6 +1144,9 @@ def record_refire(
     position: dict[str, Any],
     ladlog: list[dict[str, Any]],
     now_utc: datetime,
+    *,
+    fire_path: str | None = None,
+    taf_extreme_market: Any = None,
 ) -> None:
     """Second-fire (追火) ledger write for a session that already fired once.
 
@@ -1112,6 +1195,8 @@ def record_refire(
                 "refire_unfilled": True,
                 "entry_channel": fire.get("entry_channel"),
                 "next_entry_window": fire.get("next_entry_window"),
+                # 审计追加（2026-09-12，纯加法）：TAF 存在性 + 路径 + fire key
+                **taf_audit_fields(fire, fire_path=fire_path, taf_extreme_market=taf_extreme_market),
                 "fills": {},
                 "ladder": [
                     {k: v for k, v in intent.items() if k != "fill"} | ({"fill": intent.get("fill")} if intent.get("fill") else {})
@@ -1213,6 +1298,8 @@ def record_refire(
             "refire": True,
             "entry_channel": fire.get("entry_channel"),
             "next_entry_window": fire.get("next_entry_window"),
+            # 审计追加（2026-09-12，纯加法）：TAF 存在性 + 路径 + fire key
+            **taf_audit_fields(fire, fire_path=fire_path, taf_extreme_market=taf_extreme_market),
             "close_old_yes": close,
             "fills": {
                 str(lg.get("leg")): {"shares": lg.get("shares"), "cost": lg.get("cost_usdc"), "avg": lg.get("avg_price")}
@@ -1694,6 +1781,9 @@ def run_cycle(
                         "key": rule_key,
                         "breach_temp": temp,
                         "breach_info": breach,
+                        # 审计追加（2026-09-12，纯加法）：这一次破位评估该站有没有可用 TAF
+                        **taf_audit_fields({"key": rule_key}, fire_path=FIRE_PATH_HEDGE,
+                                           taf_extreme_market=taf_extreme_market),
                     })
 
                     # If reverse hedge legs generated, execute 追火 / 反手
@@ -1724,10 +1814,15 @@ def run_cycle(
                             "key": rule_key,
                             "fire_no": hedge_fire["fire_no"],
                             "ref_source": hedge_fire["ref_source"],
+                            # 审计追加（2026-09-12，纯加法）：对冲/追火 fire 的 TAF 暴露面
+                            **taf_audit_fields(hedge_fire, fire_path=FIRE_PATH_HEDGE,
+                                               taf_extreme_market=taf_extreme_market),
                         })
                         new_pos, ladlog = _paper_fire(cfg, state, hedge_fire, now)
                         if new_pos is not None:
-                            record_refire(cfg, state, hedge_fire, new_pos, ladlog, now)
+                            record_refire(cfg, state, hedge_fire, new_pos, ladlog, now,
+                                          fire_path=FIRE_PATH_HEDGE,
+                                          taf_extreme_market=taf_extreme_market)
                 continue
 
             # No open position for this session -> evaluate entry
@@ -1761,10 +1856,16 @@ def run_cycle(
                     "ref_source": fire_action["ref_source"],
                     "entry_channel": fire_action["entry_channel"],
                     "consensus_meta": entry_res.get("consensus_meta"),
+                    # 审计追加（2026-09-12，纯加法）：入口 fire 的 TAF 暴露面（taf_present/taf_source
+                    # 与上面的 ref_source 同源：有 TAF ⇒ "taf"，无 TAF ⇒ "market_rank1"）
+                    **taf_audit_fields(fire_action, fire_path=FIRE_PATH_ENTRY,
+                                       taf_extreme_market=taf_extreme_market),
                 })
                 pos_rec, ladlog = _paper_fire(cfg, state, fire_action, now)
                 if pos_rec is not None:
-                    _record_fire_event(cfg, state, fire_action, pos_rec, ladlog, now)
+                    _record_fire_event(cfg, state, fire_action, pos_rec, ladlog, now,
+                                       fire_path=FIRE_PATH_ENTRY,
+                                       taf_extreme_market=taf_extreme_market)
                 else:
                     rec = tree.setdefault("fired", {}).setdefault(rule_key, {})
                     rec["status"] = "fired_no_fill"
@@ -1798,17 +1899,25 @@ def run_cycle(
                 log_event(log_path, {"type": "arm", "key": action.get("key"), **{k: action[k] for k in ("ref_source", "distance_c") if k in action}})
             elif atype in ("re_fire",):
                 fire_no = int(action.get("fire_no") or 1)
+                # 审计追加（2026-09-12，纯加法）：反转策略车道的 fire 同样带 TAF 暴露面 + 路径
+                reversal_path = FIRE_PATH_REFIRE if fire_no >= 2 else FIRE_PATH_ENTRY
                 log_event(log_path, {"type": "fire_attempt", "key": action.get("key"),
                                      "fire_no": fire_no, "jump": action.get("jump"),
-                                     "ref_source": action.get("ref_source")})
+                                     "ref_source": action.get("ref_source"),
+                                     **taf_audit_fields(action, fire_path=reversal_path,
+                                                        taf_extreme_market=taf_extreme_market)})
                 position, ladlog = _paper_fire(cfg, state, action, now)
                 if position is not None:
                     if fire_no >= 2:
                         # 追火: liquidate fire #1's old YES leg (on fill) and
                         # merge the new legs into the session position.
-                        record_refire(cfg, state, action, position, ladlog, now)
+                        record_refire(cfg, state, action, position, ladlog, now,
+                                      fire_path=reversal_path,
+                                      taf_extreme_market=taf_extreme_market)
                     else:
-                        _record_fire_event(cfg, state, action, position, ladlog, now)
+                        _record_fire_event(cfg, state, action, position, ladlog, now,
+                                           fire_path=reversal_path,
+                                           taf_extreme_market=taf_extreme_market)
                 else:
                     # insufficient capital / nothing fillable — mark fired anyway
                     # so we don't retry-fire the same session each tick. Update

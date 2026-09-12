@@ -86,7 +86,10 @@ DEFAULT_CONFIG = {
     "entry_mode": "capped_taker",
     "yes_min_ask": Decimal("0.45"),                   # YES 必须确认一定胜率 (>0.45)
     "yes_max_ask": Decimal("0.75"),                   # YES 安全入场顶价，与 live 端口 taker 带门统一为 0.75，绝不追高 (>0.75 放弃)
-    "order_budget_usdc": Decimal("15.0"),              # 每次开仓 15 USDC
+    #: ⚠ 已废弃（DEPRECATED, F-A 2026-09-12）：旧 sizing 基数，**不再**是权威值。
+    #: 唯一基数 = 生效 fire 预算（引擎注入的 ``fire_budget_usdc``，见 ``order_budget()``）；
+    #: 本键只在 ``fire_budget_usdc`` 缺失时作为兼容回退（缺省 15.0），保留仅为不破坏旧调用方。
+    "order_budget_usdc": Decimal("15.0"),              # 每次开仓 15 USDC（旧基数，已废弃）
     "mid_discount": Decimal("0.90"),                   # 仅在 peg 模式下使用的折价
     "resting_order_timeout_s": 180,                    # peg 模式下挂单最长 3 分钟
     # 前置风控 (抢跑止损)
@@ -281,6 +284,29 @@ class ConsensusLockStrategy:
         self._metar_history: dict[str, list[dict[str, Any]]] = {}      # session_key -> [{"temp": float, "obs_time": float, "recorded_at": float}]
         #: 上一次"下一档桶通道"为何没下单（审计用；`next_entry_disabled` ⇒ None）
         self.last_next_entry_skip: str | None = None
+
+    def order_budget(self) -> Decimal:
+        """**唯一 sizing 基数** = 生效 fire 预算（F-A，2026-09-12）。
+
+        解析优先级（纯函数：只读 ``self.cfg``，不可解析/缺失一律回退，绝不抛异常）：
+
+        1. ``cfg["fire_budget_usdc"]`` —— 引擎（``_r_cycle._get_consensus_lock_strat``）注入的
+           **生效** fire 预算：已含 ``YES2RE_FIRE_BUDGET_USDC`` env 覆盖，且与 ``_paper_fire``
+           实际使用的 ``cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"])`` 同源。
+        2. ``cfg["order_budget_usdc"]`` —— **已废弃** 旧键，仅作兼容回退。
+        3. ``"15.0"`` —— 旧默认值（同样已废弃）。
+
+        为什么必须统一（审计 F-A，MEDIUM）：新通道把"已占用额度"记成
+        ``基数 × next_entry_budget_pct``，引擎按 ``fire_budget_usdc × pct`` 实际发单；
+        基数不等时 (i) fire < 旧基数 ⇒ 既有通道被静默少给 ``(旧基数 − fire) × pct``；
+        (ii) fire > 旧基数 ⇒ ``新通道 + 既有通道`` 合计可超过 fire 预算
+        （实测 fire=30/order=15 时 15.0 + 22.5 = 37.5 > 30，SPEC 第 5 项不变量被打破）。
+        统一到同一基数后 ``新通道预算 + 既有通道剩余 == fire`` 逐字成立。
+        """
+        fire = _dec_or_none(self.cfg.get("fire_budget_usdc"))
+        if fire is not None:
+            return fire
+        return _dec(self.cfg.get("order_budget_usdc"), "15.0")
 
     def is_fast_station(self, city_id: str) -> bool:
         if not self.cfg.get("filter_fast_stations_only", True):
@@ -493,7 +519,9 @@ class ConsensusLockStrategy:
             return {"action": "skip",
                     "reason": f"next_entry_budget_pct_invalid ({pct_raw!r}; need 0 < pct <= 1)",
                     "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
-        budget = (_dec(self.cfg.get("order_budget_usdc"), "15.0") * pct).quantize(Decimal("0.01"))
+        # F-A（2026-09-12）：sizing 基数改用**唯一基数解析器**（生效 fire 预算）。数学逐字保留：
+        # 仍是 ``基数 × pct`` 并按 0.01 取整；只是基数不再可能与引擎发的钱不一致。
+        budget = (self.order_budget() * pct).quantize(Decimal("0.01"))
         shares = (budget / next_ask).to_integral_value(rounding=ROUND_DOWN)
         if shares <= ZERO:
             return {"action": "skip", "reason": "next_entry_zero_shares_calculated",
@@ -685,7 +713,9 @@ class ConsensusLockStrategy:
             return {"action": "skip", "reason": "no_active_ask_in_book", "key": key}
 
         entry_mode = self.cfg.get("entry_mode", "capped_taker")
-        budget = _dec(self.cfg["order_budget_usdc"], "15.0")
+        # F-A（2026-09-12）：既有目标桶通道同样走**唯一基数解析器**（生效 fire 预算）。
+        # 无 fire_budget_usdc 时回退旧键 order_budget_usdc（缺省 15.0）⇒ 旧调用方/旧用例逐字不变。
+        budget = self.order_budget()
         min_ask = _dec(self.cfg["yes_min_ask"], "0.45")
         max_ask = _dec(self.cfg["yes_max_ask"], "0.75")
 

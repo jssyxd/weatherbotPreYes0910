@@ -58,6 +58,13 @@ bucket that is going to zero (observed on 2026-09-11: Toronto YES → 0.001, War
   YES price outside the band; a limit that is ``<= 0``, ``> cap`` or ``> 1``.  A cap of exactly
   ``1.0`` is accepted (it is the shipped ``no_max_ask``) but the absolute ``<= 1`` limit still
   binds, so a taker can never exceed the venue's maximum price.
+* **F-D (2026-09-12): the venue's own minimum order size is enforced on this path.**  Until now the
+  engine fire path never consulted ``min_order_size`` (the repo's only enforcement point was
+  ``live/order_plan.py``, reachable only from ``live/smoke.py`` / ``sign_dryrun``), so a leg whose
+  planned share count is below the venue minimum was sent and necessarily rejected.  ``match`` now
+  refuses such a leg locally (``order_mode=skip``, ``status=below_min_order_size``, nothing sent)
+  whenever the book carries a usable minimum; a book that does **not** carry the field keeps its
+  exact previous behaviour (no new refusal, since the venue told us nothing).
 * the YES price evidence is resolved, in order, from **this leg's own context**: the YES-leg ladder
   intent handed to ``match`` (``leg["best_ask"]``) → ``fire["ladder"]``'s YES row →
   ``fire["yes_ask"] / fire["yes_price"] / fire["yes_best_ask"]`` → one read-only re-quote of the
@@ -70,7 +77,9 @@ bucket that is going to zero (observed on 2026-09-11: Toronto YES → 0.001, War
   ``submit.py --summary`` action counts are not polluted.  ``match`` returns ``order_mode``
   (``taker``/``skip``) plus ``taker_gate``/``yes_price`` so the engine's ladder log shows why a
   leg did or did not go out.  Every other red line — triple gate, ``risk_gate``, ``check_limits``,
-  tick alignment, minimum size, least-privilege sentinels, the append-only audit — is untouched.
+  tick alignment, least-privilege sentinels, the append-only audit — is untouched.  (The venue's
+  ``min_order_size`` used to be *outside* this path; F-D added the guard, see the bullet above.)
+  ``describe()`` advertises the channel/leg-window rule and the new local refusal.
 
 .. note:: ``config/yes2re_reversal.json`` ships ``no_max_ask = "1.0"`` while ``AGENTS.md``
    documents the NO cap as ``0.65``.  The operator's instruction is "everything else unchanged",
@@ -145,8 +154,34 @@ FILL_REFUSE_UNKNOWN = "yes_price_unknown"
 FILL_REFUSE_BAND_BAD = "yes_band_unparsed"
 FILL_REFUSE_LEG_WINDOW = "leg_window_unusable"   # 腿自带窗口缺失/非法 ⇒ 弃单（绝不回退、绝不降级）
 FILL_REFUSE_NO_CAP = "taker_cap_missing"   # no explicit, usable cap ⇒ refuse (L-2)
+#: F-D（2026-09-12）：planned shares below the venue's own minimum order size ⇒ local refuse.
+#: The engine fire path never consulted ``min_order_size`` (the repo's only enforcement point was
+#: ``live/order_plan.py``, reachable only from smoke/sign_dryrun) ⇒ such a leg was sent and
+#: necessarily rejected by the venue.  Same reason string ``order_plan.BELOW_MIN_ORDER_SIZE``.
+FILL_REFUSE_BELOW_MIN = "below_min_order_size"
 
 ONE = Decimal("1")
+
+
+def _book_min_order_size(book) -> Decimal | None:
+    """Venue minimum order size in **shares** from a book dict; ``None`` when unknown.
+
+    Read-only and non-throwing.  ``None`` (field absent / ``None`` / malformed / ``<= 0``) means
+    the venue did not tell us — the caller then does **not** add a refusal, so a book shape that
+    omits the field keeps its exact previous behaviour.
+    """
+    if not isinstance(book, dict):
+        return None
+    raw = book.get("min_order_size")
+    if raw is None:
+        raw = book.get("minOrderSize")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, AttributeError, ValueError):
+        return None
+    return value if value.is_finite() and value > ZERO else None
 
 
 def _band_number(value) -> Decimal | None:
@@ -607,19 +642,35 @@ class LivePort(ExecutionPort):
         """Decide, for **this leg alone**, whether a FAK order goes out — or nothing at all.
 
         Operator rule (corrected 2026-09-12): **leg-level independent permission and never a
-        passive fallback.**  A YES leg takes only while its own price is inside
-        ``(yes_min_ask, yes_max_ask]`` (defaults 0.48 / 0.90); a non-YES leg takes while its own
-        cap and own book allow it.  Every other outcome is a **refusal/skip**, never a resting
-        ``post_only`` order — a passive order on a fake breakout fills at the bid and buys a
-        bucket that is going to zero.
+        passive fallback.**  A YES leg takes only while its own price is inside the window that
+        applies **to that leg** — the leg's own ``(floor, cap]`` when it carries one (the parallel
+        next-bucket channel), otherwise the cfg band ``(yes_min_ask, yes_max_ask]`` (defaults
+        0.48 / 0.90); a non-YES leg takes while its own cap and own book allow it.  Every other
+        outcome is a **refusal/skip**, never a resting ``post_only`` order — a passive order on a
+        fake breakout fills at the bid and buys a bucket that is going to zero.
 
         Fail-closed, in order: unusable cap (missing / unparseable / ``<= 0`` / ``> 1``) ⇒ refuse;
-        illegal band (for any leg, so a corrupt config stands the whole fire down) ⇒ refuse; no
-        resting ask at all in this leg's own book ⇒ ``no_book`` skip; an ask that is *present but
-        unusable* (non-numeric / ``<= 0`` / ``> 1``) ⇒ ``ask_out_of_range`` refuse — a bad quote is
-        not an empty book; for a YES leg only, no price evidence or a price outside the band ⇒
-        refuse.  Pure decision (plus the optional read-only YES re-quote); no order is placed and
-        nothing is mutated except this port's per-fire memo.
+        **unusable leg window** (``leg_window_unusable``: floor ``>=`` cap, non-numeric, negative,
+        …) ⇒ refuse — never a fallback to the cfg band; no resting ask at all in this leg's own
+        book ⇒ ``no_book`` skip; an ask that is *present but unusable* (non-numeric / ``<= 0`` /
+        ``> 1``) ⇒ ``ask_out_of_range`` refuse — a bad quote is not an empty book; for a YES leg
+        only, no price evidence or a price outside its window ⇒ refuse.  Pure decision (plus the
+        optional read-only YES re-quote); no order is placed and nothing is mutated except this
+        port's per-fire memo.
+
+        .. note:: **Which window can stand a fire down (F-E, 2026-09-12 — corrected invariant).**
+           A leg that carries its own window is judged **only** against that window: the cfg band
+           does not participate, so a corrupt ``yes_min_ask``/``yes_max_ask`` (e.g. 0.95 / 0.90)
+           no longer stands a next-bucket leg down — that leg is still governed by its own
+           fail-closed window.  The cfg band still governs a leg with **no** window at all (the
+           legacy target-bucket / sleeve legs), and there an illegal band still refuses
+           (``yes_band_unparsed``) and therefore still stands that leg — and with it the whole
+           fire — down.  The old blanket claim "a corrupt cfg band stands the whole fire down" is
+           no longer true once a fire carries an independent leg window, and it is **not** a
+           safety hole: the leg window is itself fail-closed and never falls back.
+
+        (``min_order_size`` is checked by :meth:`match`, not here: this method answers *"is this leg
+        allowed to take?"*, and the venue's minimum is a property of the order's **size**.)
         """
         fire = fire if isinstance(fire, dict) else {}
         leg = leg if isinstance(leg, dict) else {}
@@ -714,6 +765,20 @@ class LivePort(ExecutionPort):
                     "order_mode": SKIP, "taker_gate": ctx["taker_gate"],
                     "yes_price": ctx["yes_price"], "fill_and_kill": False, "source": LIVE,
                     "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window}
+        # F-D（2026-09-12，fail-closed 本地守卫）：计划股数 < venue 的 min_order_size ⇒ 本腿弃单，
+        # **不发**注定被交易所拒的单（审计 finding：引擎 fire 路径从不检查 min_order_size）。判定
+        # 只在 venue 真的给了可用 min 时才生效（缺失/畸形 ⇒ 不加新拒单，行为与以前逐字相同）。
+        min_size = _book_min_order_size(book)
+        if min_size is not None and shares < min_size:
+            return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
+                    "status": FILL_REFUSE_BELOW_MIN, "order_id": None, "residual_risk": False,
+                    "limit_price": None, "clamped": False, "source": LIVE,
+                    "detail": (f"planned {shares} share(s) < venue min_order_size {min_size} — "
+                               f"refuse locally, nothing sent (below_min_order_size)"),
+                    "order_mode": SKIP, "taker_gate": ctx["taker_gate"],
+                    "yes_price": ctx["yes_price"], "fill_and_kill": False,
+                    "min_order_size": str(min_size),
+                    "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window}
         token_id = leg.get("token_id")
         neg_risk, neg_src = self.resolve_neg_risk(client, token_id, book)
         if neg_risk is None:
@@ -746,9 +811,14 @@ class LivePort(ExecutionPort):
             audit_path=self.audit_path,
             # 通道字段走**专用入参**（不是 audit_extra）：execute_leg 在合并完 audit_extra 之后
             # 用它盖章，因此调用方塞进 audit_extra 的 entry_channel/leg_window 一律被剔除 ⇒ 不可伪造。
+            # F-B/F-C（2026-09-12）：window_source / next_entry_window 与 neg_risk_source 同样改走专用
+            # 入参（此前它们只在 audit_extra 里 ⇒ 裸 API 调用方可注入同名字段）。
             leg_channel=ctx.get("entry_channel"),
             leg_window=leg_window,
-            audit_extra={**audit_extra, "neg_risk": bool(neg_risk), "neg_risk_source": neg_src},
+            leg_window_source=ctx.get("window_source"),
+            leg_next_entry_window=(fire or {}).get("next_entry_window"),
+            neg_risk_source=neg_src,
+            audit_extra=dict(audit_extra),
         )
         return {"filled_shares": result.get("filled_shares") or ZERO,
                 "avg_price": result.get("avg_price"),
@@ -775,6 +845,11 @@ class LivePort(ExecutionPort):
                 "taker_gates": [GATE_YES_BAND, GATE_NO_LEG_ASK],
                 "taker_scope": "leg_level_independent", "yes_legs": list(YES_LEG_NAMES),
                 "entry_channels": list(ENTRY_CHANNELS),
+                #: F-D：本端口**自己**就拒的那些单（不必等交易所回 400）
+                "local_refusals": [FILL_REFUSE_BELOW_MIN],
+                "min_order_size_rule": ("腿的计划股数 < 该腿 book 的 min_order_size ⇒ 本地弃单 "
+                                        "(order_mode=skip, status=below_min_order_size, 不发单)；"
+                                        "book 未提供该字段 ⇒ 不新增拒单（按未知处理）"),
                 "next_entry_window_rule": ("entry_channel == 'next_bucket' ⇒ 腿自带 (floor, cap] "
                                            "窗口生效，cfg 的 yes_min_ask/yes_max_ask 不动它；"
                                            "无腿窗口才回退 cfg")}

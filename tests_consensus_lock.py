@@ -599,6 +599,89 @@ def test_next_entry_non_price_gates_not_relaxed():
           "(站点/时间窗/极值桶位/变率/共识 rank1 五门全部仍然拦截)")
 
 
+def test_budget_base_unified_fire_budget():
+    """F-A（审计 MEDIUM）：**唯一预算基数 = 生效 fire 预算** + 参数化不变量。
+
+    修复前：策略用 ``order_budget_usdc``（config=15.0）算"新通道已占用"，引擎按 ``fire_budget_usdc``
+    发单 ⇒ fire=12 时既有通道被少给 1.5 USDC；fire=30 时 15.0 + 22.5 = 37.5 > 30（不变量被打破）。
+    现在两处同源（引擎把生效 fire 预算注入策略 cfg），于是对任意 fire / pct：
+    ``新通道预算 + 既有通道剩余 ≤ fire`` 且 ``计划名义额合计 ≤ fire``。
+    """
+    key = "paris|2026-09-10|high"
+    # (0) 解析器语义：fire_budget_usdc 优先；缺失/不可解析 ⇒ 回退**废弃**键 order_budget_usdc；皆无 ⇒ 15.0
+    assert ConsensusLockStrategy({"fire_budget_usdc": "12", "order_budget_usdc": "15.0"}).order_budget() == Decimal("12")
+    assert ConsensusLockStrategy({"fire_budget_usdc": 30, "order_budget_usdc": "15.0"}).order_budget() == Decimal("30")
+    assert ConsensusLockStrategy({"fire_budget_usdc": None, "order_budget_usdc": "7.5"}).order_budget() == Decimal("7.5")
+    assert ConsensusLockStrategy({"fire_budget_usdc": "abc", "order_budget_usdc": "7.5"}).order_budget() == Decimal("7.5")
+    assert ConsensusLockStrategy({"order_budget_usdc": "15.0"}).order_budget() == Decimal("15.0")
+    assert ConsensusLockStrategy({}).order_budget() == Decimal("15.0")
+
+    print("  [F-A] 唯一基数 = 生效 fire 预算；参数化矩阵 fire × next_entry_budget_pct")
+    for fire in ("5", "10", "12", "15", "30", "50"):
+        for pct in ("0.5", "0.0", "1.0"):
+            fire_d, pct_d = Decimal(fire), Decimal(pct)
+            # 引擎注入后的策略 cfg 形态（`_r_cycle._get_consensus_lock_strat`）：
+            # fire_budget_usdc = 生效 fire 预算；order_budget_usdc 故意留成 15.0（与 fire 不等）
+            # ⇒ 当前代码若仍读旧键，下面的断言全部失败。
+            strat, res, *_ = _next_entry_case(
+                "0.22", ask_target="0.60",
+                cfg_extra={"fire_budget_usdc": fire, "next_entry_budget_pct": pct})
+            assert strat.order_budget() == fire_d, (fire, pct, strat.order_budget())
+            want_next = (fire_d * pct_d).quantize(Decimal("0.01"))
+            if pct_d <= Decimal("0"):
+                # pct 非法（0.0）⇒ 新通道**弃单**（只记 last_next_entry_skip，既有语义），
+                # 既有通道随后按自己的窗口独立成交，且用**统一基数**（= fire）sizing
+                assert "next_entry_budget_pct_invalid" in (strat.last_next_entry_skip or ""), \
+                    (fire, strat.last_next_entry_skip)
+                assert strat.state.session_next_entry_used.get(key) is None, (fire, pct)
+                assert res["action"] == "execute_taker_fire", (fire, pct, res)
+                assert res["entry_channel"] == "target_bucket", (fire, pct, res)
+                assert Decimal(res["cost_usdc"]) <= fire_d, (fire, pct, res)   # 吃满但不超过 fire
+                new_budget, new_planned = Decimal("0"), Decimal("0")
+            else:
+                assert res["action"] == "execute_taker_fire", (fire, pct, res)
+                assert res["entry_channel"] == "next_bucket", (fire, pct, res)
+                assert res["budget_usdc"] == str(want_next), (fire, pct, res["budget_usdc"], want_next)
+                new_budget = Decimal(res["budget_usdc"])
+                new_planned = Decimal(res["cost_usdc"])           # shares × ask（真实计划名义额）
+                assert strat.state.session_next_entry_used[key] == want_next, (fire, pct)
+                # 策略侧预算 == 引擎侧预算（`_r_cycle.consensus_entry_fire` 的 (fire × pct).quantize）
+                assert new_budget == (fire_d * pct_d).quantize(Decimal("0.01")), (fire, pct)
+                assert new_planned <= new_budget, (fire, pct, new_planned, new_budget)
+            existing_budget = strat.target_channel_budget(key, fire_d)
+            # 不变量 ①：两通道额度均 ≥ 0；②：合计 ≤ fire；③：计划名义额合计 ≤ fire
+            assert new_budget >= Decimal("0") and existing_budget >= Decimal("0"), (fire, pct)
+            assert new_budget + existing_budget <= fire_d, (fire, pct, new_budget, existing_budget)
+            # 既有通道在同一价格（0.60）下的计划名义额 = floor(剩余额度 / 0.60) × 0.60
+            existing_planned = ((existing_budget / Decimal("0.60")).to_integral_value(rounding=ROUND_DOWN)
+                                * Decimal("0.60"))
+            assert existing_planned <= existing_budget, (fire, pct)
+            assert new_planned + existing_planned <= fire_d, (
+                fire, pct, new_planned, existing_planned, "计划名义额合计必须 ≤ fire 预算")
+            # 回归证据（修复前的旧基数 = order_budget_usdc=15.0）：
+            # 旧引擎侧新通道预算 = fire × pct，旧策略侧已占用 = 15 × pct ⇒ 旧既有通道剩余 = fire − 15×pct
+            legacy_engine_new = (fire_d * pct_d).quantize(Decimal("0.01"))
+            legacy_existing = max(Decimal("0"), fire_d - (Decimal("15.0") * pct_d).quantize(Decimal("0.01")))
+            if pct_d > Decimal("0"):
+                if fire_d > Decimal("15.0"):
+                    # fire 高于旧基数 ⇒ 旧行为**必然**越界（审计实测 fire=30/pct=0.5 ⇒ 37.5 > 30）
+                    assert legacy_engine_new + legacy_existing > fire_d, (fire, pct)
+                elif fire_d < Decimal("15.0"):
+                    # fire 低于旧基数 ⇒ 旧行为**静默少给**既有通道（审计实测 fire=12 ⇒ 4.5 而非 6.0）；
+                    # 当新通道已吃满 fire（pct=1.0）时两者同为 0，故只在剩余 > 0 时要求严格更少。
+                    assert legacy_existing <= existing_budget, (fire, pct, legacy_existing, existing_budget)
+                    if existing_budget > Decimal("0"):
+                        assert legacy_existing < existing_budget, (fire, pct, legacy_existing, existing_budget)
+                else:
+                    # fire == 旧基数 ⇒ 旧行为与新行为一致（对账：证明差异只源于基数不一致）
+                    assert legacy_existing == existing_budget, (fire, pct, legacy_existing, existing_budget)
+            print(f"    fire={fire:>3} pct={pct}  新通道预算={new_budget:>5}  "
+                  f"既有通道剩余={existing_budget:>5}  合计={new_budget + existing_budget:>5} ≤ {fire_d}"
+                  f"   计划名义额合计={new_planned + existing_planned} ≤ {fire_d}")
+    print("PASS: 16. test_budget_base_unified_fire_budget "
+          "(唯一基数=fire 预算；18 组 fire×pct 不变量全部成立；旧基数越界被实证)")
+
+
 def main():
     test_station_filter()
     test_time_window()
@@ -615,7 +698,8 @@ def main():
     test_next_entry_window_boundary_matrix()
     test_next_entry_priority_and_budget_isolation()
     test_next_entry_non_price_gates_not_relaxed()
-    print("\nALL 15 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
+    test_budget_base_unified_fire_budget()
+    print("\nALL 16 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

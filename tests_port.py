@@ -2005,6 +2005,129 @@ def test_live_taker_next_entry_channel_audit_not_spoofable():
     assert "buy_yes_next" in described["yes_legs"], described
 
 
+def test_v2_transport_unforgeable_audit_keys():
+    """F-B/F-C（LOW）：9 个"不可伪造"键 —— 调用方塞进 ``audit_extra`` 同名值一律被剔除。
+
+    覆盖：taker 的 intent/submit 行、maker 的 intent 行、以及 **5 条 early-deny 路径**的 deny 行
+    （此前 deny 行会把注入的 ``entry_channel``/``leg_window`` 原样带走 ⇒ "哪条通道被拒"可被伪造）。
+    权威值只来自本层的计算值或专用入参；专用入参缺失时该键**不出现**（绝不落调用方的值）。
+    """
+    keys = v2_transport.SPOOFABLE_AUDIT_KEYS
+    assert set(keys) == {"order_api", "amount", "amount_unit", "entry_channel", "leg_window",
+                         "window_source", "next_entry_window", "neg_risk", "neg_risk_source"}, keys
+    spoof = {"order_api": "limit", "amount": "999.99", "amount_unit": "shares",
+             "entry_channel": "target_bucket", "leg_window": "(0.45, 0.75]",
+             "window_source": "cfg_yes_band", "next_entry_window": "(0.10, 0.99]",
+             "neg_risk": False, "neg_risk_source": "forged"}
+
+    def _rows(**kw):
+        client = _taker_client(matched="10", price="0.30", token="TOK_NEXT")
+        call = {"token_id": "TOK_NEXT", "side": "BUY", "price": "0.30", "size": "10", "tick": "0.01",
+                "book": TAKER_BOOK, "gates": GATES_OK, "cap": "0.32"}
+        call.update(kw)                                  # 允许逐例覆盖 price/size/cap/taker/...
+        with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+            log = Path(tmp) / "live_events.jsonl"
+            out = v2_transport.execute_leg(client, audit_path=log, sleep=lambda _s: None,
+                                           poll_attempts=2, **call)
+            lines = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return out, lines
+
+    # (a) taker + 伪造块，无专用入参 ⇒ 9 键全部不落盘（amount/order_api 由本层计算值盖章）
+    out, lines = _rows(taker=True, audit_extra=dict(spoof))
+    assert out["ok"] is True, out
+    assert [l["action"] for l in lines] == ["intent", "submit"], lines
+    for line in lines:
+        p = line["params"]
+        assert p["order_api"] == "market" and p["amount"] == "3.00" and p["amount_unit"] == "USDC", p
+        for absent in ("entry_channel", "leg_window", "window_source", "next_entry_window",
+                       "neg_risk", "neg_risk_source"):
+            assert absent not in p, (absent, p)
+    # (b) taker + 伪造块 + 专用入参 ⇒ 落盘值全部是专用入参（不是伪造值）
+    out, lines = _rows(taker=True, audit_extra=dict(spoof),
+                       leg_channel="next_bucket", leg_window=NEXT_WINDOW,
+                       leg_window_source="leg_window", leg_next_entry_window=NEXT_WINDOW,
+                       neg_risk=True, neg_risk_source="book")
+    assert out["ok"] is True, out
+    for line in lines:
+        p = line["params"]
+        assert p["entry_channel"] == "next_bucket" and p["leg_window"] == NEXT_WINDOW, p
+        assert p["window_source"] == "leg_window" and p["next_entry_window"] == NEXT_WINDOW, p
+        assert p["neg_risk"] is True and p["neg_risk_source"] == "book", p
+        assert p["order_api"] == "market" and p["amount"] == "3.00", p
+
+    # (c) 白名单外的通道值不被盖章（但伪造值也进不来）
+    out, lines = _rows(taker=True, audit_extra=dict(spoof), leg_channel="evil_channel",
+                       leg_window="(0.01, 0.99]")
+    for line in lines:
+        assert "entry_channel" not in line["params"] and "leg_window" not in line["params"], line
+
+    # (d) maker 分支：order_api=limit（本层计算值），伪造的 market/amount 不得出现
+    out, lines = _rows(taker=False, clamp=False, audit_extra=dict(spoof))
+    assert out["ok"] is True, out
+    for line in lines:
+        p = line["params"]
+        assert p["order_api"] == "limit" and p["post_only"] is True, p
+        for absent in (k for k in keys if k != "order_api"):
+            assert absent not in p, (absent, p)
+
+    # (e) 5 条 early-deny 路径的 deny 行：注入的 9 键一个都不得带走
+    deny_cases = [
+        ("taker_cap_required", {"cap": None}),
+        ("price_out_of_range", {"cap": "0.32", "price": "1.5"}),
+        ("above_cap", {"cap": "0.20"}),
+        ("price_not_on_tick", {"cap": "0.32", "price": "0.305"}),
+        ("amount_below_precision", {"cap": "0.32", "size": "0.0000001"}),
+    ]
+    for reason, overrides in deny_cases:
+        out, lines = _rows(taker=True, audit_extra=dict(spoof), **overrides)
+        assert out["ok"] is False and out["status"] == reason, (reason, out)
+        assert [l["action"] for l in lines] == ["deny"], (reason, lines)
+        assert lines[0]["reason"] == reason, (reason, lines[0])
+        for absent in keys:
+            assert absent not in lines[0]["params"], (reason, absent, lines[0]["params"])
+    print("PASS: test_v2_transport_unforgeable_audit_keys "
+          "(9 键不可伪造：taker/maker/白名单外 + 5 条 early-deny 行全部干净)")
+
+
+def test_live_match_below_min_order_size_local_refusal():
+    """F-D（LOW）：引擎 fire 路径在计划股数 < venue ``min_order_size`` 时**本地**弃单。
+
+    边界：4.9 股（< 5）弃单且零调用、5.0 股（== min）放行、5.1 股（> min）放行；book 未提供
+    ``min_order_size``（或不可解析）⇒ **不新增拒单**（行为与此前逐字相同）。
+    """
+    assert port_mod.FILL_REFUSE_BELOW_MIN == "below_min_order_size"
+    min_book = {**NEXT_BOOK, "min_order_size": "5"}
+
+    def _match(shares, book):
+        transport = _StubTransport()
+        port = _live_port(transport, account=ACCOUNT_OK, preflight=True)
+        got = port.match(leg=_next_leg("0.25"), book=book, limit=Decimal("0.30"),
+                         shares=Decimal(shares), fire=_next_fire("0.25"), cfg=CFG)
+        return got, _sent(transport)
+
+    for shares, want in (("4.9", False), ("5.0", True), ("5.1", True)):
+        got, calls = _match(shares, min_book)
+        if want:
+            assert got["order_mode"] == "taker" and len(calls) == 1, (shares, got, calls)
+        else:
+            assert got["order_mode"] == "skip", (shares, got)
+            assert got["status"] == "below_min_order_size", (shares, got)
+            assert calls == [], (shares, calls)                     # 一笔都不发
+            assert got["filled_shares"] == ZERO and got["unfilled"] == Decimal(shares), got
+            assert "below_min_order_size" in got["detail"], got
+            assert got["min_order_size"] == "5", got
+    # book 没给 min_order_size（或给的是垃圾/0）⇒ 不新增拒单，4.9 股照常走
+    for book in (NEXT_BOOK, {**NEXT_BOOK, "min_order_size": None},
+                 {**NEXT_BOOK, "min_order_size": "abc"}, {**NEXT_BOOK, "min_order_size": "0"}):
+        got, calls = _match("4.9", book)
+        assert got["order_mode"] == "taker" and len(calls) == 1, (book, got, calls)
+    # 端口把这条本地拒单广告出来（describable）
+    described = _live_port(_StubTransport(), account=ACCOUNT_OK, preflight=True).describe()
+    assert "below_min_order_size" in described["local_refusals"], described
+    print("PASS: test_live_match_below_min_order_size_local_refusal "
+          "(4.9 股弃单零发单 / 5.0、5.1 股放行 / 无 min 字段不新增拒单)")
+
+
 CHECKS = [
     ("config: env overrides (mode/budget/max_open)", test_load_config_env_overrides),
     ("config: live via env still needs port gates", test_env_override_live_still_needs_port_gates),
@@ -2039,6 +2162,8 @@ CHECKS = [
     ("live taker: engine fire path is leg-level", test_live_fire_intent_is_leg_level),
     ("live next-entry: leg window drives the take (cfg band ignored)", test_live_taker_next_entry_leg_window_gate),
     ("live next-entry: channel audit, not spoofable by audit_extra", test_live_taker_next_entry_channel_audit_not_spoofable),
+    ("v2: 9 unforgeable audit keys (F-B/F-C, incl. early-deny rows)", test_v2_transport_unforgeable_audit_keys),
+    ("live: min_order_size local refusal (F-D, 4.9/5.0/5.1)", test_live_match_below_min_order_size_local_refusal),
 ]
 
 
