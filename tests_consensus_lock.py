@@ -29,11 +29,19 @@ def make_buckets() -> list[dict]:
 
 
 def test_station_filter():
-    strat = ConsensusLockStrategy()
-    assert strat.is_fast_station("paris") is True
-    assert strat.is_fast_station("tokyo") is True
-    assert strat.is_fast_station("miami") is False  # 60 min
-    assert strat.is_fast_station("chicago") is False
+    # ① 过滤器关闭（当前生产配置：操作者 2026-09-12 决定"放开全部 49 站"）⇒ 任何站都被允许
+    off = ConsensusLockStrategy()
+    assert off.cfg.get("filter_fast_stations_only") is False, "生产配置应为放开全部站点"
+    assert off.is_fast_station("paris") is True
+    assert off.is_fast_station("tokyo") is True
+    assert off.is_fast_station("miami") is True       # 60 min 站在过滤器关闭后同样被允许
+    assert off.is_fast_station("chicago") is True
+    # ② 过滤器打开（保留语义）⇒ 仅高频站白名单通过
+    on = ConsensusLockStrategy(cfg={"filter_fast_stations_only": True})
+    assert on.is_fast_station("paris") is True
+    assert on.is_fast_station("tokyo") is True
+    assert on.is_fast_station("miami") is False       # 60 min
+    assert on.is_fast_station("chicago") is False
     print("PASS: 1. test_station_filter")
 
 

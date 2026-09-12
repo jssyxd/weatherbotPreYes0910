@@ -58,7 +58,7 @@ FAST_METAR_CITIES: set[str] = {
 
 # 优化后生产配置
 DEFAULT_CONFIG = {
-    "filter_fast_stations_only": True,
+    "filter_fast_stations_only": False,
     "high_local_start": 14,                           # 避开正午强对流与急剧升温期 (14:00~18:00)
     "high_local_end": 18,
     "low_local_start": 0,

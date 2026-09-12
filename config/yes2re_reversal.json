@@ -19,7 +19,7 @@
   "log_path": "data/yes2re_events.jsonl",
   "health_path": "data/yes2re_health.json",
   "consensus_lock": {
-    "filter_fast_stations_only": true,
+    "filter_fast_stations_only": false,
     "high_local_start": 14,
     "high_local_end": 18,
     "low_local_start": 0,

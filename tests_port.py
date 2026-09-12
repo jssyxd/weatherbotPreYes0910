@@ -705,7 +705,7 @@ GOLDEN_CONFIG = json.loads(r"""
   "early_stop_enabled": true,
   "early_stop_next_bucket_surge": "0.35",
   "entry_mode": "capped_taker",
-  "filter_fast_stations_only": true,
+  "filter_fast_stations_only": false,
   "high_local_end": 18,
   "high_local_start": 14,
   "low_local_end": 9,
