@@ -1,5 +1,11 @@
 # Changelog — weatherbotPreYes0910
 
+## 2026-09-12 — 修 settle_failed 根因（裸 socket 读超时中断整轮结算；同步自共享引擎）
+
+- **同缺陷**：`market_adapter._fetch_json` 未处理裸 `TimeoutError`（socket 读超时不包成 `URLError`）→ 穿透 `fetch_market_resolution` 的窄捕获 → `_r_cycle` 记 `settle_failed` 并**中止整轮结算**。两仓 `market_adapter.py` md5 相同，属共享引擎缺陷。
+- **修复（操作者选 A）**：`_fetch_json` 增 `except TimeoutError → RuntimeError` ⇒ 超时按 unresolved 返回 `None`，由 `settle_poll_seconds` 下轮重试，不再中断整轮。
+- **验证**：新增 `tests_market_adapter.py` 4/4；本仓全绿（`tests_port` 31/31、`tests_live` 51/51、`tests_reversal`、`tests_fill_gate`、`tests_consensus_lock` 11、`tests_cycle_consensus_lock`、`tests_sleeve_*` 13/4）。
+
 ## 2026-09-12 — CRITICAL: 修 neg_risk 签名域丢失（实盘 fire 100% 下不出去）+ 引擎预算与 live 上限对齐
 
 **背景（真实链路演练实测暴露，非推断）**：用引擎自身链路 `_r_cycle._paper_fire` 在真实市场下单，连续 3 次被 CLOB 拒绝：
