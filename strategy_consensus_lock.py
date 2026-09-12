@@ -72,7 +72,7 @@ DEFAULT_CONFIG = {
     # 执行模式: "capped_taker" (推荐) 或 "best_bid_peg"
     "entry_mode": "capped_taker",
     "yes_min_ask": Decimal("0.45"),                   # YES 必须确认一定胜率 (>0.45)
-    "yes_max_ask": Decimal("0.80"),                   # YES 安全入场顶价，适度放宽至 0.80，绝不追超高 (>0.80 放弃)
+    "yes_max_ask": Decimal("0.75"),                   # YES 安全入场顶价，与 live 端口 taker 带门统一为 0.75，绝不追高 (>0.75 放弃)
     "order_budget_usdc": Decimal("15.0"),              # 每次开仓 15 USDC
     "mid_discount": Decimal("0.90"),                   # 仅在 peg 模式下使用的折价
     "resting_order_timeout_s": 180,                    # peg 模式下挂单最长 3 分钟

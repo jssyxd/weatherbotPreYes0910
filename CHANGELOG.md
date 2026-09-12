@@ -1,5 +1,11 @@
 # Changelog — weatherbotPreYes0910
 
+## 2026-09-12 — 统一 YES 吃单带为 0.75（fire 范围 ≡ live taker 带门）
+- `config/yes2re_reversal.json`：`consensus_lock.yes_max_ask` **0.80 → 0.75**；`strategy_consensus_lock.py` 内置换默认同步 0.75。
+- 原因（操作者拍板）：live 端口 taker 带门读 `strategy.yes_max_ask`（= 0.75），而 PreYes 入场顶价原为 0.80 ⇒ fire 限价落在 **(0.75, 0.80]** 时实盘会 `yes_price_above_band` 跳过（"fire 却不成交"），纸面/实盘同区间分歧。统一后三处一致：`consensus_lock.yes_max_ask` = `strategy.yes_max_ask` = `risk_control_yes_cap` = **0.75**。
+- `tests_port.py`：配置防漂移 GOLDEN 快照同步更新。
+- 验证：`tests_port` 31/31、`tests_live` 51/51、`tests_consensus_lock` 11/11、`tests_cycle_consensus_lock` PASS、`tests_fill_gate` 6 场景、`tests_reversal` PASS、sleeve 13/13 + 4/4。
+
 ## 2026-09-12 — 激进吃单 (FAK Taker) 精度修复 + Nautilus Trader v2.0 规范对齐 + 全量 142 单测通过
 
 - **激进吃单 (FAK Taker) 生产精度对齐 (`live/v2_transport.py`)**：

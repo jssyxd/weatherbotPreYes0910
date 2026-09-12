@@ -31,7 +31,7 @@
     "min_dwell_seconds_if_rising": 1800,
     "entry_mode": "capped_taker",
     "yes_min_ask": "0.45",
-    "yes_max_ask": "0.80",
+    "yes_max_ask": "0.75",
     "order_budget_usdc": 15.0,
     "early_stop_enabled": true,
     "early_stop_next_bucket_surge": "0.35",

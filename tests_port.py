@@ -719,7 +719,7 @@ GOLDEN_CONFIG = json.loads(r"""
   "order_budget_usdc": 15.0,
   "risk_control_no_cap": "0.85",
   "risk_control_yes_cap": "0.75",
-  "yes_max_ask": "0.80",
+  "yes_max_ask": "0.75",
   "yes_min_ask": "0.45"
  },
  "contract_cities_path": "config/contract_cities.json",
