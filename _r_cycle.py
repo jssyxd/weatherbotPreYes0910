@@ -1333,6 +1333,11 @@ def run_cycle(
 
     Caller (``runner_impl``) chooses sleep cadence from the return value:
     fast-poll (~10s) when armed, else scan interval (~20s)."""
+    from zoneinfo import ZoneInfo  # 本地导入（本模块既有风格）。本函数下方 TAF 块内（L~1650）的那处
+    # `from zoneinfo import ZoneInfo` 只在"有 TAF 且日期相符"时才执行，而破位反手/追火分支（L~1710）的
+    # `local_fire_time` 也要用它 ⇒ **无 TAF（market_rank1 回退）时该名字未绑定**，会在正要发 hedge fire
+    # 的那一刻抛 UnboundLocalError 并中断整轮（其余腿顺延）。此处函数顶部自绑：有 TAF 时同名解析、
+    # 逐字不变；无 TAF 时不再炸。同形状缺陷的先例见本模块 sleeve 调用点热修注释与 F1 修复。
     now = now_utc or datetime.now(timezone.utc)
     log_path = cfg.get("log_path", "data/yes2re_events.jsonl")
     cities = load_active_cities(cfg)

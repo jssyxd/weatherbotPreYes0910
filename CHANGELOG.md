@@ -1,5 +1,49 @@
 # Changelog — weatherbotPreYes0910
 
+## 2026-09-12 — 修复 F2：破位反手/追火分支的 `ZoneInfo` 未绑定（`UnboundLocalError` 中断整轮）
+
+**缺陷（代码 + 实证双确认）**：`_r_cycle.py::run_cycle()` 的破位反手/追火分支构造 `hedge_fire` 时使用
+`ZoneInfo(city.get("timezone", "UTC"))`（修复前 L1710）。而该名字在**本函数作用域内的唯一绑定**位于 TAF 块内部
+（`if taf_rec is not None:` → `if valid_iso and taf_c is not None:` → `try: from zoneinfo import ZoneInfo`，L1650）
+⇒ 站点**无 TAF**（或 TAF 与当日 local date 不符，走 `market_rank1` 回退）时该块根本不执行、名字未绑定，
+**恰在持仓已被风控割肉清仓之后、正要发反手 hedge fire 的那一刻**抛 `UnboundLocalError`，整轮被中断（其余腿顺延）。
+属**潜伏缺陷**：生产日志 `UnboundLocalError=0`／`cycle_error=0`／`breach_detected=0` ⇒ 从未触发；
+**首次出现"追火/反手 + 该站无 TAF"必然炸**，且时序最坏（浮亏已实现、对冲腿未发出）。
+
+**修法（最小、纯加法，+5 行 / −0 行）**：在 `run_cycle()` docstring 之后、函数顶部自绑
+`from zoneinfo import ZoneInfo`（含成因注释），风格与 F1（`consensus_entry_fire`）及 sleeve 调用点热修一致。
+**不触碰**任何判定 / 阈值 / 门序 / 窗口逻辑，**不触碰**"下一档桶 `buy_yes_next`"通道代码。
+有 TAF 时同名解析、`hedge_fire` 逐字不变；无 TAF 时不再炸。
+
+**证据（原始输出见 `/tmp/preyes_f2_fix_report.md`）**：
+- **基线复现**：worktree `ccbd0c8` 上构造"破位 + 无 TAF（`market_rank1` 回退）"场景 ⇒
+  `_r_cycle.py:1602` 抛 `UnboundLocalError: cannot access local variable 'ZoneInfo'`；修复前工作区同场景在
+  L1710 抛同一异常（原文 traceback 留档）。修复后同场景正常产出 `hedge_fire`，`local_fire_time`
+  可被 `datetime.fromisoformat` 解析且时区正确（Paris `+02:00` / Tokyo `+09:00`），`fire_attempt` 审计行落盘。
+- **行为不变**：有 TAF 的同一场景，`hedge_fire` 与基线 `ccbd0c8` **逐字相同**（JSON 字节级一致，已冻结为
+  回归 golden `tests_breach_hedge.py::TAF_GOLDEN`，并与 worktree 原始输出程序化比对通过）。
+- **穷举绑定核查**（AST + 分支守卫精确判定）：`_r_cycle.py` 共 **5** 个 `ZoneInfo` 使用点；修复前
+  **4/5 SAFE、1 处 UNSAFE（=L1710）**；修复后 **5/5 SAFE**。另两处（`target_dates_by_icao` L129 /
+  `_rule_is_local_today` L156）的绑定紧邻使用点、同一 block 恒先于使用执行 ⇒ 无需改动。
+- **测试**：新增 `tests_breach_hedge.py`（3 例：无 TAF 不抛且产 fire、有 TAF 逐字等于基线 golden、
+  两路径仅差 `ref_extreme`：TAF 33.0 vs METAR 32.5）。全套件 PASS：
+  `tests_consensus_lock` **15/15**、`tests_cycle_consensus_lock` **4/4**、`tests_breach_hedge` **3/3**、
+  `tests_port` **33/33**、`tests_live` **51/51**、`tests_fill_gate` **6 gate scenarios**、
+  `tests_reversal` **24/24**、`tests_sleeve_signal` **13/13**、`tests_sleeve_wiring` **4/4**、
+  `tests_market_adapter` **4/4**（全部 exit 0）。
+- **paper 回归**：`paper_reversal_sim.py --scenarios-only` 输出 sha256 在
+  `ccbd0c8` / 修复前工作区 / 修复后工作区 **三者完全一致**（`3d16632c458bb969…`）⇒ 该路径不经过本分支，
+  **无行为差异**（无需归因）。
+- **变异测试**：删掉新增绑定 ⇒ `tests_breach_hedge.py` 必失败
+  （`UnboundLocalError: cannot access local variable 'ZoneInfo'`，probe traceback 落在 L1710）；
+  被删文件 blob 与 HEAD 完全一致（`c881ec4e…`）证明只删了本修复、未误伤他处；
+  **逐字还原**后 sha256 回到 `a2f9dae4…`、`git diff` 仍为 `+5 / -0`、回归用例重新全绿。
+
+**行为影响 / 风险**：唯一行为变化 = "无 TAF 站点的首次追火/反手不再中断整轮"。
+不修等价于该站点当天破位后**永久失去对冲腿**且每轮 `cycle_error`。
+未引入任何策略/阈值/预算变更（`fire_budget_usdc` = 10.0 与 `consensus_lock.order_budget_usdc` = 10.0 的既有
+对齐保持不变）。
+
 ## 2026-09-12 — 新增并行通道 `buy_yes_next`「下一档桶廉价入场」（**代码默认关闭，config 显式开启**）
 
 **决策依据（实测，非推断）**：`/home/da/桌面/poly-yes2/preyes_param_sim_20260912.md` §4/§5/§6。
