@@ -200,7 +200,7 @@ def test_paper_fire_next_entry_channel_budget_and_audit():
         "ref_extreme": 31.0, "ref_source": "market_rank1", "running_extreme": 31.2, "jump": 0,
         "target_bucket_id": "b32", "bucket_id": "b32",
         "local_fire_time": "2026-09-10T16:00:00+02:00", "market_unit": "C", "fire_no": 1,
-        "budget_usdc": "7.50", "entry_channel": "next_bucket", "next_entry_window": "(0.20, 0.32]",
+        "budget_usdc": "7.50", "entry_channel": "next_bucket", "next_entry_window": "[0.20, 0.32]",
         "legs": [{
             "leg": "buy_yes_next", "token_id": next_tok, "side": "BUY", "outcome": "YES",
             "cap": "0.32", "floor": "0.20", "notional_pct": "1.0", "bucket_id": "b32",
@@ -211,7 +211,7 @@ def test_paper_fire_next_entry_channel_budget_and_audit():
     }
     pos, ladlog = _r_cycle._paper_fire(cfg, state, fire, now)
     assert pos is not None, "新通道 fire 应成交"
-    assert pos["entry_channel"] == "next_bucket" and pos["next_entry_window"] == "(0.20, 0.32]"
+    assert pos["entry_channel"] == "next_bucket" and pos["next_entry_window"] == "[0.20, 0.32]"
     assert pos["budget_usdc"] == "7.50", pos["budget_usdc"]      # 预算隔离：只用 0.5 × fire 预算
     leg = pos["legs"][0]
     assert leg["leg"] == "buy_yes_next" and leg["bucket_id"] == "b32"
@@ -230,7 +230,7 @@ def test_paper_fire_next_entry_channel_budget_and_audit():
     rows = [_json.loads(l) for l in open(log_path, encoding="utf-8").read().splitlines() if l.strip()]
     fires = [r for r in rows if r.get("type") == "fire"]
     assert fires and fires[-1]["entry_channel"] == "next_bucket", fires
-    assert fires[-1]["next_entry_window"] == "(0.20, 0.32]", fires
+    assert fires[-1]["next_entry_window"] == "[0.20, 0.32]", fires
     assert state["positions"]["paris|2026-09-10|high"]["entry_channel"] == "next_bucket"
 
     # 既有通道（无 entry_channel / budget_usdc=15）行为逐字不变：仍吃满 fire 预算
@@ -300,7 +300,7 @@ def test_consensus_entry_fire_channel_specs():
         expected_ref=31.0, taf_extreme_market=31.0, temp=31.2, market_unit="C",
         entry_res=res_next, now=now)
     assert fire["entry_channel"] == "next_bucket" and fire["budget_usdc"] == "7.50", fire
-    assert fire["next_entry_window"] == "(0.20, 0.32]", fire
+    assert fire["next_entry_window"] == "[0.20, 0.32]", fire
     leg = fire["legs"][0]
     assert leg["leg"] == "buy_yes_next" and leg["entry_channel"] == "next_bucket", leg
     assert leg["cap"] == "0.32" and leg["floor"] == "0.20" and leg["bucket_id"] == "b32", leg

@@ -17,7 +17,7 @@ def leg(**kw):
                              Decimal("10"), NOW, 0)
 
 
-def main():
+def test_fill_gate():
     assert leg(ask="0.30")["status"] == "below_floor", "ask below floor must not fill"
     assert leg(ask="0.48")["status"] == "below_floor", "floor is strict >0.48"
     assert leg(ask="0.55")["status"] == "send_fak", "in-window ask must send FAK"
@@ -26,6 +26,10 @@ def main():
     nofloor = leg(ask="0.30", floor="")
     assert nofloor["status"] == "send_fak", "no floor -> cheap ask still fills"
     print("PASS 6 gate scenarios")
+
+
+def main():
+    test_fill_gate()
 
 
 if __name__ == "__main__":

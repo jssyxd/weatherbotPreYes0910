@@ -371,7 +371,7 @@ def test_next_bucket_instantaneous_book_checks():
 # --------------------------------------------------------------------------- #
 NEXT_CFG = {
     "next_entry_enabled": True,
-    "next_entry_min_ask": "0.20",
+    "next_entry_min_ask": "0.27",
     "next_entry_max_ask": "0.32",
     "next_entry_budget_pct": "0.5",
     "order_budget_usdc": "15.0",
@@ -385,7 +385,7 @@ def _next_entry_case(ask_next: str, *, ask_target: str = "0.90", cfg_extra: dict
                      next_sample_ask: str = "0.12"):
     """一个"非价格门全通过 + 给定下一档桶 ask"的场景（新通道测试用）。
 
-    `ask_target` 默认 0.90 = 实盘观测到的目标桶报价（被既有 cap 0.75 挡死）；`ask_next` 是新通道
+    `ask_target` 默认 0.90 = 实盘观测到的目标桶报价（被既有 cap 0.81 挡死）；`ask_next` 是新通道
     唯一的变量；`next_sample_ask` 决定 tracker 里下一档桶的历史 TWAP（0.12 ⇒ ~0.10，低于既有
     0.26 门）。返回 (strat, res, tracker, now, city, books)。
     """
@@ -418,11 +418,11 @@ def test_next_entry_channel_default_off_and_config_gate():
     default = ConsensusLockStrategy()
     assert default.cfg["next_entry_enabled"] is False, "代码默认必须是关闭"
     win = default.next_entry_window()
-    assert win["ok"] is True and str(win["lo"]) == "0.20" and str(win["hi"]) == "0.32"
-    assert win["label"] == "(0.20, 0.32]"
+    assert win["ok"] is True and str(win["lo"]) == "0.27" and str(win["hi"]) == "0.32"
+    assert win["label"] == "[0.27, 0.32]"
 
-    # 关闭态：即使下一档桶 ask=0.25 在窗口内，也必须走既有通道（被既有共识/顶价门挡下）
-    strat_off, res_off, *_ = _next_entry_case("0.25", enabled=False)
+    # 关闭态：即使下一档桶 ask=0.28 在窗口内，也必须走既有通道（被既有共识/顶价门挡下）
+    strat_off, res_off, *_ = _next_entry_case("0.28", enabled=False)
     assert res_off["action"] == "skip", res_off
     assert ("ask_above_safety_cap" in res_off["reason"]
             or "next_bucket_instant_ask_too_high" in res_off["reason"]), res_off
@@ -430,19 +430,19 @@ def test_next_entry_channel_default_off_and_config_gate():
     assert "paris|2026-09-10|high" not in strat_off.state.open_positions
 
     # 开启态：同一场景由新通道成交（证明 window 是唯一的开关差异）
-    strat_on, res_on, *_ = _next_entry_case("0.25", enabled=True)
+    strat_on, res_on, *_ = _next_entry_case("0.28", enabled=True)
     assert res_on["action"] == "execute_taker_fire"
     assert res_on["entry_channel"] == "next_bucket"
     assert res_on["bucket_id"] == "b32" and res_on["token_id"] == "Y32"
 
     # 明确的语义替代（有意为之，报告里如实记录）：下一档桶的 twap/instant **价格子门**
-    # （0.26/0.25/0.15）是既有目标桶通道的过滤器；新通道用**自有窗口** (0.20, 0.32] 替代它，
+    # （0.26/0.25/0.15）是既有目标桶通道的过滤器；新通道用**自有窗口** [0.27, 0.32] 替代它，
     # 因此 twap>=0.26 时新通道仍可入场 —— 但 ask 必须落在窗口内（见边界矩阵：0.321 仍弃单）。
-    strat_sub, res_sub, *_ = _next_entry_case("0.25", next_sample_ask="0.41")
+    strat_sub, res_sub, *_ = _next_entry_case("0.28", next_sample_ask="0.41")
     assert float(res_sub["consensus_meta"]["next_bucket_twap"]) >= 0.26, res_sub
     assert res_sub["action"] == "execute_taker_fire" and res_sub["entry_channel"] == "next_bucket", res_sub
     # 同一 fixture、通道关闭 ⇒ 既有通道被 twap 价格子门挡死（证明这里确实是"替代"而非"绕过"）
-    _, res_sub_off, *_ = _next_entry_case("0.25", next_sample_ask="0.41", enabled=False)
+    _, res_sub_off, *_ = _next_entry_case("0.28", next_sample_ask="0.41", enabled=False)
     assert res_sub_off["action"] == "skip" and "next_bucket_twap_too_high" in res_sub_off["reason"], res_sub_off
 
     # 非法窗口（lo >= hi）⇒ 整通道弃单，绝不回退既有 (0.45, 0.75]：
@@ -461,10 +461,10 @@ def test_next_entry_channel_default_off_and_config_gate():
 
 
 def test_next_entry_window_boundary_matrix():
-    """窗口边界矩阵 (0.20, 0.32]：0.199/0.200/0.201/0.319/0.320/0.321 ⇒ 弃/弃/入/入/入/弃。"""
-    probes = [("0.199", "skip"), ("0.200", "skip"), ("0.201", "fire"),
+    """窗口边界矩阵 [0.27, 0.32]：0.269/0.270/0.271/0.319/0.320/0.321 ⇒ 弃/入/入/入/入/弃。"""
+    probes = [("0.269", "skip"), ("0.270", "fire"), ("0.271", "fire"),
               ("0.319", "fire"), ("0.320", "fire"), ("0.321", "skip")]
-    print("  [next-entry window boundary matrix] window = (0.20, 0.32]  (half-open)")
+    print("  [next-entry window boundary matrix] window = [0.27, 0.32]  (closed)")
     for raw, want in probes:
         strat, res, *_ = _next_entry_case(raw)
         got = "fire" if res.get("action") == "execute_taker_fire" else "skip"
@@ -474,39 +474,45 @@ def test_next_entry_window_boundary_matrix():
         assert got == want, (raw, want, res)
         if want == "fire":
             assert res["entry_channel"] == "next_bucket" and res["bucket_id"] == "b32", res
-            assert res["floor"] == "0.20" and res["cap"] == "0.32", res
-            assert res["window"] == "(0.20, 0.32]" and res["next_entry_window"] == "(0.20, 0.32]", res
+            assert res["floor"] == "0.27" and res["cap"] == "0.32", res
+            assert res["window"] == "[0.27, 0.32]" and res["next_entry_window"] == "[0.27, 0.32]", res
             assert Decimal(res["fill_price"]) == Decimal(raw), res
             assert Decimal(res["shares"]) * Decimal(res["fill_price"]) <= Decimal("7.50"), res
-            assert Decimal(res["shares"]) == (Decimal("7.50") / Decimal(raw)).to_integral_value(
-                rounding=ROUND_DOWN), res
+            expected_shares = (Decimal("7.50") / Decimal(raw)).to_integral_value(rounding=ROUND_DOWN)
+            # FAK hard-cap check: budget / lo
+            max_shares = (Decimal("7.50") / Decimal("0.27")).to_integral_value(rounding=ROUND_DOWN)
+            if expected_shares > max_shares:
+                expected_shares = max_shares
+            assert Decimal(res["shares"]) == expected_shares, res
         else:
-            expect = "next_entry_ask_below_window" if Decimal(raw) <= Decimal("0.20") \
+            expect = "next_entry_ask_below_window" if Decimal(raw) < Decimal("0.27") \
                 else "next_entry_ask_above_window"
             assert skip_reason and expect in skip_reason, (raw, skip_reason)
             # 弃单 ⇒ 新通道没有任何仓位/额度占用
             assert strat.state.session_next_entry_used.get("paris|2026-09-10|high") is None
-    # 半开端点的精确复核：0.20 本身弃单、0.32 本身入场
-    s1, r1, *_ = _next_entry_case("0.2")
+    # 闭区间端点的精确复核：0.27 本身入场、0.32 本身入场、0.269 弃单
+    s1, r1, *_ = _next_entry_case("0.269")
     assert r1["action"] == "skip" and "next_entry_ask_below_window" in (s1.last_next_entry_skip or "")
-    s2, r2, *_ = _next_entry_case("0.32")
+    s2, r2, *_ = _next_entry_case("0.27")
     assert r2["action"] == "execute_taker_fire", r2
+    s2b, r2b, *_ = _next_entry_case("0.32")
+    assert r2b["action"] == "execute_taker_fire", r2b
     # 窗口是自有且独立的：改窗口 ⇒ 边界随之移动
     s3, r3, *_ = _next_entry_case("0.26", cfg_extra={"next_entry_min_ask": "0.28"})
     assert r3["action"] == "skip" and "next_entry_ask_below_window" in (s3.last_next_entry_skip or "")
-    print("PASS: 13. test_next_entry_window_boundary_matrix (半开窗口 6 组边界全部符合预期)")
+    print("PASS: 13. test_next_entry_window_boundary_matrix (闭区间窗口 6 组边界全部符合预期)")
 
 
 def test_next_entry_priority_and_budget_isolation():
     """通道优先级 + 预算隔离：新通道先评估；命中则既有通道不下单；两者预算永不重叠。"""
     key = "paris|2026-09-10|high"
-    # (a) 两个通道同时可成交（目标桶 0.60 ∈ (0.45,0.75]；下一档 0.25 ∈ (0.20,0.32]）
-    strat, res, *_ = _next_entry_case("0.25", ask_target="0.60")
+    # (a) 两个通道同时可成交（目标桶 0.60 ∈ (0.45,0.81]；下一档 0.28 ∈ [0.27,0.32]）
+    strat, res, *_ = _next_entry_case("0.28", ask_target="0.60")
     assert res["action"] == "execute_taker_fire", res
     assert res["entry_channel"] == "next_bucket", "新通道必须优先，既有通道本次不得下单"
     assert res["bucket_id"] == "b32" and res["token_id"] == "Y32", res
-    assert Decimal(res["shares"]) == Decimal("30")            # floor(7.5 / 0.25)
-    assert Decimal(res["cost_usdc"]) == Decimal("7.50")
+    assert Decimal(res["shares"]) == Decimal("26")            # floor(7.5 / 0.28)
+    assert Decimal(res["cost_usdc"]) == Decimal("7.28")
     assert res["budget_usdc"] == "7.50" and res["budget_pct"] == "0.5"
     assert strat.state.session_next_entry_used[key] == Decimal("7.50")
     # 既有通道只剩剩余额度（7.5 已被新通道占用 ⇒ 15 − 7.5 = 7.5）
@@ -517,16 +523,16 @@ def test_next_entry_priority_and_budget_isolation():
         make_city("paris"), "2026-09-10", "high", make_buckets(), 31.0,
         {"temp_c": 31.2, "obs_age_s": 2000}, {
             "Y31": {"best_bid": "0.80", "best_ask": "0.60"},
-            "Y32": {"best_bid": "0.10", "best_ask": "0.25"}}, ConsensusTracker(),
+            "Y32": {"best_bid": "0.10", "best_ask": "0.28"}}, ConsensusTracker(),
         datetime(2026, 9, 10, 13, 5, 0, tzinfo=timezone.utc))
     assert res_again["action"] == "skip" and res_again["reason"] == "session_already_has_open_position"
 
-    # (b) 新通道弃单（下一档 0.20 == 窗口下界，半开区间不含）⇒ 既有通道按**原窗口**独立判定并成交
+    # (b) 新通道弃单（下一档 0.20 < 窗口下界 0.27）⇒ 既有通道按**原窗口**独立判定并成交
     strat2, res2, *_ = _next_entry_case("0.20", ask_target="0.60")
     assert strat2.last_next_entry_skip and "next_entry_ask_below_window" in strat2.last_next_entry_skip
     assert res2["action"] == "execute_taker_fire", res2
     assert res2["entry_channel"] == "target_bucket" and res2["bucket_id"] == "b31", res2
-    assert res2["cap"] == "0.75", res2                       # 既有窗口一字未改
+    assert res2["cap"] == "0.81", res2                       # 既有窗口顶价为 0.81
     assert Decimal(res2["shares"]) == Decimal("25")          # floor(15 / 0.60) ⇒ 吃满 fire 预算
     assert strat2.target_channel_budget(key, Decimal("15")) == Decimal("15")
     assert strat2.state.session_next_entry_used.get(key) is None, "弃单不得占用任何额度"
@@ -624,8 +630,9 @@ def test_budget_base_unified_fire_budget():
             # fire_budget_usdc = 生效 fire 预算；order_budget_usdc 故意留成 15.0（与 fire 不等）
             # ⇒ 当前代码若仍读旧键，下面的断言全部失败。
             strat, res, *_ = _next_entry_case(
-                "0.22", ask_target="0.60",
-                cfg_extra={"fire_budget_usdc": fire, "next_entry_budget_pct": pct})
+                "0.28", ask_target="0.60",
+                cfg_extra={"fire_budget_usdc": fire, "next_entry_budget_pct": pct,
+                           "next_bucket_max_instant_ask": "0.35"})
             assert strat.order_budget() == fire_d, (fire, pct, strat.order_budget())
             want_next = (fire_d * pct_d).quantize(Decimal("0.01"))
             if pct_d <= Decimal("0"):
@@ -682,6 +689,105 @@ def test_budget_base_unified_fire_budget():
           "(唯一基数=fire 预算；18 组 fire×pct 不变量全部成立；旧基数越界被实证)")
 
 
+def test_next_bucket_decoupled_stop_loss_and_cooldown():
+    """验证下一档通道与目标桶通道止损解耦及 1200 秒冷却期。
+    
+    1. 目标桶通道 (target_bucket)：
+       - early_stop_bid_floor = 0.45 严格维持
+       - bid 跌破 0.45 立即触发割肉，无冷却期抑制
+    2. 下一档通道 (next_bucket)：
+       - 门限按 entry_price * 0.50 与 0.12 孰大计算
+       - 入场价 0.30 时门限为 0.15；bid=0.25 (旧逻辑下 <0.45 必死) 在新逻辑下安全存活 (None)
+       - bid=0.10 (<0.15) 且处于 1200 秒冷却期内时触发 early_stop_suppressed，且首发/重复去重生效
+       - 超过 1200 秒后触发真实割肉 liquidate
+       - 条件 A (下一档暴涨突破 0.35) 具有更高优先级，即使在冷却期内也立即强平割肉
+       - 底线保护：入场价 0.20 时 0.20*0.5=0.10 < 0.12，底线门限自动钳位至 0.12
+    """
+    cfg = {
+        "early_stop_bid_floor": Decimal("0.45"),
+        "early_stop_next_bucket_surge": Decimal("0.35"),
+        "next_bucket_stop_loss_pct": Decimal("0.50"),
+        "next_bucket_bid_floor": Decimal("0.12"),
+        "early_stop_grace_seconds": 1200,
+    }
+    strat = ConsensusLockStrategy(cfg)
+    bks = make_buckets()
+    key = "paris|2026-09-10|high"
+    t0 = datetime(2026, 9, 10, 14, 0, 0, tzinfo=timezone.utc)
+
+    # ① 目标桶通道：持仓成本 0.65，bid 跌至 0.40 (<0.45)，无视冷却期立即触发止损
+    strat.state.open_positions[key] = PositionRecord(
+        session_key=key, bucket_id="b31", yes_token_id="Y31",
+        shares=Decimal("20"), cost_usdc=Decimal("13.00"), avg_price=Decimal("0.65"),
+        entry_ts_utc=t0.isoformat(), entry_channel="target_bucket",
+    )
+    books = {"Y31": {"best_bid": "0.40", "best_ask": "0.48"}, "Y32": {"best_bid": "0.20", "best_ask": "0.25"}}
+    res_target = strat.evaluate_early_stop_loss(key, "high", bks, books, t0 + timedelta(seconds=100))
+    assert res_target is not None and res_target["action"] == "early_stop_loss_executed"
+    assert "bid_floor_broken" in res_target["reason"]
+
+    # ② 下一档通道解耦验证：入场价 0.30，持仓桶为 b32 (下一档为 b33)
+    strat.state.suppressed_early_stops.clear()
+    strat.state.open_positions[key] = PositionRecord(
+        session_key=key, bucket_id="b32", yes_token_id="Y32",
+        shares=Decimal("25"), cost_usdc=Decimal("7.50"), avg_price=Decimal("0.30"),
+        entry_ts_utc=t0.isoformat(), entry_channel="next_bucket",
+    )
+
+    # 2a. bid=0.25：在旧全局 0.45 下会被误杀；在解耦门限 max(0.30*0.5, 0.12)=0.15 下安全存活！
+    books_normal = {"Y32": {"best_bid": "0.25", "best_ask": "0.28"}, "Y33": {"best_bid": "0.10", "best_ask": "0.15"}}
+    res_alive = strat.evaluate_early_stop_loss(key, "high", bks, books_normal, t0 + timedelta(seconds=300))
+    assert res_alive is None, "0.25 > 0.15 且无暴涨，下一档持仓必须存活"
+
+    # 2b. bid=0.10 (<0.15 跌破)：处于 1200s 冷却期内 (t=300s) -> 触发抑制 early_stop_suppressed
+    books_dip = {"Y32": {"best_bid": "0.10", "best_ask": "0.14"}, "Y33": {"best_bid": "0.10", "best_ask": "0.15"}}
+    res_suppressed = strat.evaluate_early_stop_loss(key, "high", bks, books_dip, t0 + timedelta(seconds=300))
+    assert res_suppressed is not None
+    assert res_suppressed["action"] == "early_stop_suppressed"
+    assert res_suppressed["duplicate"] is False
+    assert res_suppressed["grace_seconds"] == 1200
+    assert res_suppressed["remaining_grace_seconds"] == 900.0
+
+    # 再次调用验证 duplicate=True 去重标记
+    res_dup = strat.evaluate_early_stop_loss(key, "high", bks, books_dip, t0 + timedelta(seconds=305))
+    assert res_dup is not None and res_dup["duplicate"] is True
+
+    # 2c. 条件 A 优先级覆盖：虽然在冷却期内 (t=400s)，但下一档危险桶 (Y33) ask 暴涨至 0.36 (>=0.35) -> 越级立即割肉
+    books_surge = {"Y32": {"best_bid": "0.10", "best_ask": "0.14"}, "Y33": {"best_bid": "0.30", "best_ask": "0.36"}}
+    res_surge = strat.evaluate_early_stop_loss(key, "high", bks, books_surge, t0 + timedelta(seconds=400))
+    assert res_surge is not None and res_surge["action"] == "early_stop_loss_executed"
+    assert "next_bucket_surge" in res_surge["reason"]
+
+    # 2d. 超过冷却期 (t=1300s > 1200s) 且 bid=0.10 (<0.15) -> 冷却期结束，触发真实割肉
+    # 重新装载未被强平的新持仓（2c 已将原持仓 pos.liquidated 置 True）
+    strat.state.open_positions[key] = PositionRecord(
+        session_key=key, bucket_id="b32", yes_token_id="Y32",
+        shares=Decimal("25"), cost_usdc=Decimal("7.50"), avg_price=Decimal("0.30"),
+        entry_ts_utc=t0.isoformat(), entry_channel="next_bucket",
+    )
+    res_timeout = strat.evaluate_early_stop_loss(key, "high", bks, books_dip, t0 + timedelta(seconds=1300))
+    assert res_timeout is not None and res_timeout["action"] == "early_stop_loss_executed"
+    assert "chan=next_bucket" in res_timeout["reason"]
+    assert Decimal(res_timeout["recovered_usdc"]) == Decimal("2.50")
+
+    # 2e. 兜底保护 0.12：入场价 0.20 时 0.20*0.5=0.10 < 0.12，门限钳位到 0.12
+    strat.state.open_positions[key] = PositionRecord(
+        session_key=key, bucket_id="b32", yes_token_id="Y32",
+        shares=Decimal("30"), cost_usdc=Decimal("6.00"), avg_price=Decimal("0.20"),
+        entry_ts_utc=t0.isoformat(), entry_channel="next_bucket",
+    )
+    books_floor_above = {"Y32": {"best_bid": "0.13", "best_ask": "0.16"}, "Y33": {"best_bid": "0.05", "best_ask": "0.10"}}
+    res_floor_above = strat.evaluate_early_stop_loss(key, "high", bks, books_floor_above, t0 + timedelta(seconds=1300))
+    assert res_floor_above is None, "0.13 > 0.12 不触发止损"
+
+    books_floor_below = {"Y32": {"best_bid": "0.11", "best_ask": "0.14"}, "Y33": {"best_bid": "0.05", "best_ask": "0.10"}}
+    res_floor_below = strat.evaluate_early_stop_loss(key, "high", bks, books_floor_below, t0 + timedelta(seconds=1300))
+    assert res_floor_below is not None and res_floor_below["action"] == "early_stop_loss_executed"
+    assert "bid=0.11 < floor 0.12" in res_floor_below["reason"]
+
+    print("PASS: 17. test_next_bucket_decoupled_stop_loss_and_cooldown")
+
+
 def main():
     test_station_filter()
     test_time_window()
@@ -699,7 +805,8 @@ def main():
     test_next_entry_priority_and_budget_isolation()
     test_next_entry_non_price_gates_not_relaxed()
     test_budget_base_unified_fire_budget()
-    print("\nALL 16 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
+    test_next_bucket_decoupled_stop_loss_and_cooldown()
+    print("\nALL 17 OPTIMIZATION UNIT TESTS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

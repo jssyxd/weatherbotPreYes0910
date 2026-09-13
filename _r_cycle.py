@@ -1677,7 +1677,10 @@ def run_cycle(
                 strat.state.stopped_out_sessions.add(rule_key)
                 strat.state.breached_sessions.add(rule_key)
             elif pos and not pos.get("settled") and not pos.get("liquidated"):
+                entry_channel = pos.get("entry_channel") or ""
                 for l in pos.get("legs", []):
+                    if not entry_channel:
+                        entry_channel = l.get("entry_channel") or ""
                     if l.get("outcome") == "YES" and Decimal(str(l.get("shares") or 0)) > ZERO:
                         strat.state.open_positions[rule_key] = PositionRecord(
                             session_key=rule_key,
@@ -1688,32 +1691,45 @@ def run_cycle(
                             avg_price=Decimal(str(l.get("avg_price") or 0)),
                             entry_ts_utc=pos.get("fires_at_utc", ""),
                             liquidated=False,
+                            entry_channel=l.get("entry_channel") or entry_channel,
                         )
                 early_stop = strat.evaluate_early_stop_loss(
                     rule_key, rule.get("direction"), rule.get("buckets", []), rule_books, now
                 )
                 if early_stop:
-                    liq_res = {}
-                    for leg in pos.get("legs", []):
-                        if leg.get("outcome") == "YES" and not leg.get("settled"):
-                            res = close_leg_at_best_bid(
-                                state, leg, rule_books,
-                                closed_by="early_stop_loss",
-                                settled_at_utc=re_execution.iso_utc(now),
-                            )
-                            liq_res[leg.get("token_id")] = res
-                    pos["settled"] = True
-                    pos["liquidated"] = True
-                    pos["liquidation_type"] = early_stop.get("reason")
-                    strat.state.stopped_out_sessions.add(rule_key)
-                    strat.state.breached_sessions.add(rule_key)
-                    log_event(log_path, {
-                        "type": "early_stop_loss",
-                        "key": rule_key,
-                        "reason": early_stop.get("reason"),
-                        "liquidation": liq_res,
-                        "ts_utc": re_execution.iso_utc(now),
-                    })
+                    if early_stop.get("action") == "early_stop_suppressed":
+                        if not early_stop.get("duplicate"):
+                            log_event(log_path, {
+                                "type": "early_stop_suppressed",
+                                "key": rule_key,
+                                "reason": early_stop.get("reason"),
+                                "bid": early_stop.get("bid"),
+                                "floor": early_stop.get("floor"),
+                                "remaining_grace_seconds": early_stop.get("remaining_grace_seconds"),
+                                "ts_utc": re_execution.iso_utc(now),
+                            })
+                    else:
+                        liq_res = {}
+                        for leg in pos.get("legs", []):
+                            if leg.get("outcome") == "YES" and not leg.get("settled"):
+                                res = close_leg_at_best_bid(
+                                    state, leg, rule_books,
+                                    closed_by="early_stop_loss",
+                                    settled_at_utc=re_execution.iso_utc(now),
+                                )
+                                liq_res[leg.get("token_id")] = res
+                        pos["settled"] = True
+                        pos["liquidated"] = True
+                        pos["liquidation_type"] = early_stop.get("reason")
+                        strat.state.stopped_out_sessions.add(rule_key)
+                        strat.state.breached_sessions.add(rule_key)
+                        log_event(log_path, {
+                            "type": "early_stop_loss",
+                            "key": rule_key,
+                            "reason": early_stop.get("reason"),
+                            "liquidation": liq_res,
+                            "ts_utc": re_execution.iso_utc(now),
+                        })
 
         icao = city_by_id.get(rule.get("city_id"), {}).get("icao", "").upper()
         obs = metar_by_icao.get(icao)

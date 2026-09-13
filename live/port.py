@@ -150,6 +150,7 @@ FILL_SKIP_NO_BOOK = "no_book"              # this leg's book has no resting ask 
 FILL_REFUSE_ASK_BAD = "ask_out_of_range"   # a quote IS there but unusable (<= 0 / > 1 / NaN) ⇒ refuse
 FILL_REFUSE_BELOW = "yes_price_below_band"
 FILL_REFUSE_ABOVE = "yes_price_above_band"
+FILL_REFUSE_BELOW_FLOOR = "ask_below_floor"
 FILL_REFUSE_UNKNOWN = "yes_price_unknown"
 FILL_REFUSE_BAND_BAD = "yes_band_unparsed"
 FILL_REFUSE_LEG_WINDOW = "leg_window_unusable"   # 腿自带窗口缺失/非法 ⇒ 弃单（绝不回退、绝不降级）
@@ -198,12 +199,17 @@ def _band_number(value) -> Decimal | None:
 
 
 def _band_raw(cfg: dict | None, name: str):
-    """Read a strategy parameter from ``cfg`` — flat first, then ``cfg["strategy"]``."""
+    """Read a strategy parameter from ``cfg`` — flat first, then consensus_lock, then ``cfg["strategy"]``."""
     if not isinstance(cfg, dict):
         return None
     value = cfg.get(name)
     if value is not None:
         return value
+    consensus_lock = cfg.get("consensus_lock")
+    if isinstance(consensus_lock, dict):
+        val = consensus_lock.get(name)
+        if val is not None:
+            return val
     strategy = cfg.get("strategy")
     if isinstance(strategy, dict):
         return strategy.get(name)
@@ -418,7 +424,7 @@ def leg_take_window(leg: dict | None, fire: dict | None, cfg: dict | None) -> di
                            f"(never a fallback to the cfg band, never a passive order)")}
     return {"ok": True, "lo": (lo if lo is not None else ZERO), "hi": hi, "channel": channel,
             "source": WINDOW_SOURCE_LEG,
-            "detail": f"({lo if lo is not None else ZERO}, {hi}]", "reason": REASON_OK}
+            "detail": f"[{lo if lo is not None else ZERO}, {hi}]", "reason": REASON_OK}
 
 
 def yes_leg_price(fire: dict | None, *, leg: dict | None = None) -> dict:
@@ -717,6 +723,15 @@ class LivePort(ExecutionPort):
                     "detail": "no YES price evidence — refuse (never a passive order)"}
         base["yes_price"] = px
         base["source"] = source
+        channel = band.get("channel")
+        if channel == CHANNEL_NEXT:
+            if band["lo"] <= px <= band["hi"]:
+                return {**base, "taker": True, "order_mode": TAKER, "reason": FILL_TAKER,
+                        "detail": f"YES {px} in [{band['lo']}, {band['hi']}] — take ({source})"}
+            below = px < band["lo"]
+            return {**base, "reason": FILL_REFUSE_BELOW_FLOOR if below else FILL_REFUSE_ABOVE,
+                    "detail": (f"YES {px} {'<' if below else '>'} band "
+                               f"[{band['lo']}, {band['hi']}] — refuse, no order sent ({source})")}
         if in_yes_band(px, band["lo"], band["hi"]):
             return {**base, "taker": True, "order_mode": TAKER, "reason": FILL_TAKER,
                     "detail": f"YES {px} in ({band['lo']}, {band['hi']}] — take ({source})"}
@@ -744,8 +759,11 @@ class LivePort(ExecutionPort):
                     "detail": "preflight must run before any order"}
         ctx = self.fill_mode(fire=fire, leg=leg, cfg=cfg, book=book, client=client)
         #: the window the decision was actually judged against, as a readable label (audit).
-        leg_window = (f"({ctx['lo']}, {ctx['hi']}]"
-                      if ctx.get("lo") is not None and ctx.get("hi") is not None else None)
+        if ctx.get("lo") is not None and ctx.get("hi") is not None:
+            leg_window = (f"[{ctx['lo']}, {ctx['hi']}]" if ctx.get("entry_channel") == CHANNEL_NEXT
+                          else f"({ctx['lo']}, {ctx['hi']}]")
+        else:
+            leg_window = None
         audit_extra = {"taker_gate": ctx["taker_gate"], "taker_gate_ok": ctx["taker"],
                        "yes_price": str(ctx["yes_price"]) if ctx["yes_price"] is not None else None,
                        "yes_price_source": ctx["source"], "fill_mode": ctx["reason"],
@@ -757,6 +775,19 @@ class LivePort(ExecutionPort):
                        "window_source": ctx.get("window_source"),
                        "next_entry_window": (fire or {}).get("next_entry_window")}
         if not ctx["taker"]:
+            if ctx.get("entry_channel") == CHANNEL_NEXT and ctx.get("reason") == FILL_REFUSE_BELOW_FLOOR:
+                submit.audit({
+                    "actor": "live/port.py",
+                    "action": "deny",
+                    "reason": FILL_REFUSE_BELOW_FLOOR,
+                    "params": {
+                        "ask": str(ctx["yes_price"]),
+                        "floor": str(ctx["lo"]),
+                        "leg": leg.get("leg"),
+                        "entry_channel": CHANNEL_NEXT,
+                        "window_source": ctx.get("window_source"),
+                    },
+                }, path=self.audit_path)
             # take-or-nothing: a leg that is out of band / uncapped / unpriced / has no book is
             # dropped here.  No order of ANY kind is sent — the historical passive fallback is gone.
             return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares,
@@ -765,6 +796,19 @@ class LivePort(ExecutionPort):
                     "order_mode": SKIP, "taker_gate": ctx["taker_gate"],
                     "yes_price": ctx["yes_price"], "fill_and_kill": False, "source": LIVE,
                     "entry_channel": ctx.get("entry_channel"), "leg_window": leg_window}
+        # FAK share hard-cap: shares <= budget / min_ask
+        budget_val = leg.get("budget_usdc") or (fire or {}).get("budget_usdc")
+        if budget_val is None and isinstance(cfg, dict):
+            budget_val = cfg.get("fire_budget_usdc") or cfg.get("order_budget_usdc")
+        if budget_val is not None and ctx.get("lo") and ctx["lo"] > ZERO:
+            try:
+                b_dec = Decimal(str(budget_val))
+                if b_dec > ZERO:
+                    max_allowed = (b_dec / ctx["lo"]).to_integral_value(rounding=ROUND_DOWN)
+                    if max_allowed > ZERO and shares > max_allowed:
+                        shares = max_allowed
+            except Exception:
+                pass
         # F-D（2026-09-12，fail-closed 本地守卫）：计划股数 < venue 的 min_order_size ⇒ 本腿弃单，
         # **不发**注定被交易所拒的单（审计 finding：引擎 fire 路径从不检查 min_order_size）。判定
         # 只在 venue 真的给了可用 min 时才生效（缺失/畸形 ⇒ 不加新拒单，行为与以前逐字相同）。
@@ -846,7 +890,7 @@ class LivePort(ExecutionPort):
                 "taker_scope": "leg_level_independent", "yes_legs": list(YES_LEG_NAMES),
                 "entry_channels": list(ENTRY_CHANNELS),
                 #: F-D：本端口**自己**就拒的那些单（不必等交易所回 400）
-                "local_refusals": [FILL_REFUSE_BELOW_MIN],
+                "local_refusals": [FILL_REFUSE_BELOW_MIN, FILL_REFUSE_BELOW_FLOOR],
                 "min_order_size_rule": ("腿的计划股数 < 该腿 book 的 min_order_size ⇒ 本地弃单 "
                                         "(order_mode=skip, status=below_min_order_size, 不发单)；"
                                         "book 未提供该字段 ⇒ 不新增拒单（按未知处理）"),

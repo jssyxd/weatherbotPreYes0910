@@ -703,6 +703,7 @@ GOLDEN_CONFIG = json.loads(r"""
  "consensus_lock": {
   "early_stop_bid_floor": "0.45",
   "early_stop_enabled": true,
+  "early_stop_grace_seconds": 1200,
   "early_stop_next_bucket_surge": "0.35",
   "entry_mode": "capped_taker",
   "filter_fast_stations_only": false,
@@ -712,18 +713,20 @@ GOLDEN_CONFIG = json.loads(r"""
   "low_local_start": 0,
   "max_fires_per_session": 2,
   "min_dwell_seconds_if_rising": 1800,
+  "next_bucket_bid_floor": "0.12",
   "next_bucket_max_instant_ask": "0.25",
   "next_bucket_max_instant_bid": "0.15",
   "next_bucket_max_twap": "0.26",
+  "next_bucket_stop_loss_pct": "0.50",
   "next_bucket_twap_window_s": 3600,
   "next_entry_budget_pct": "0.5",
   "next_entry_enabled": true,
   "next_entry_max_ask": "0.32",
-  "next_entry_min_ask": "0.20",
+  "next_entry_min_ask": "0.27",
   "order_budget_usdc": 10.0,
   "risk_control_no_cap": "0.85",
   "risk_control_yes_cap": "0.75",
-  "yes_max_ask": "0.75",
+  "yes_max_ask": "0.81",
   "yes_min_ask": "0.45"
  },
  "contract_cities_path": "config/contract_cities.json",
@@ -1848,8 +1851,8 @@ def _patched(module, **attributes):
 # ------------------- parallel next-bucket channel: leg-level window + audit (2026-09-12)
 
 #: the parallel channel's own window, as the strategy/engine write it on the fire and the leg
-NEXT_WINDOW = "(0.20, 0.32]"
-NEXT_BOOK = {"best_ask": "0.25", "best_bid": "0.10", "tick_size": "0.01", "neg_risk": True}
+NEXT_WINDOW = "[0.27, 0.32]"
+NEXT_BOOK = {"best_ask": "0.28", "best_bid": "0.10", "tick_size": "0.01", "neg_risk": True}
 
 NEXT_FIRE = {
     "key": "london|2026-09-10|high", "city_id": "london", "icao": "EGLL",
@@ -1859,12 +1862,12 @@ NEXT_FIRE = {
     "entry_channel": "next_bucket", "next_entry_window": NEXT_WINDOW,
     "target_bucket_id": "B2", "new_bucket_id": "B2",
     "legs": [{"leg": "buy_yes_next", "token_id": "TOK_NEXT", "side": "BUY", "outcome": "YES",
-              "cap": "0.32", "floor": "0.20", "notional_pct": "1.0", "bucket_id": "B2",
+              "cap": "0.32", "floor": "0.27", "notional_pct": "1.0", "bucket_id": "B2",
               "entry_channel": "next_bucket"}],
 }
 
 
-def _next_leg(px=None, *, cap="0.32", floor="0.20", token="TOK_NEXT") -> dict:
+def _next_leg(px=None, *, cap="0.32", floor="0.27", token="TOK_NEXT") -> dict:
     """The next-channel YES leg the ladder intent hands to ``match`` (own floor/cap + channel)."""
     leg: dict = {"leg": "buy_yes_next", "token_id": token, "side": "BUY", "outcome": "YES",
                  "cap": cap, "floor": floor, "notional_pct": "1.0", "entry_channel": "next_bucket"}
@@ -1882,19 +1885,19 @@ def _next_fire(px=None, **overrides):
 
 
 def test_live_taker_next_entry_leg_window_gate():
-    """腿级窗口贯通：新通道的 YES 腿由**腿自带** (floor, cap] 判定，cfg 的 0.45/0.75 动不了它。
+    """腿级窗口贯通：新通道的 YES 腿由**腿自带** [floor, cap] 判定，cfg 的 0.45/0.81 动不了它。
 
-    矩阵 (0.20, 0.32]：0.199/0.200/0.201/0.319/0.320/0.321 ⇒ 弃/弃/入/入/入/弃；每一次都统计
+    矩阵 [0.27, 0.32]：0.269/0.270/0.271/0.319/0.320/0.321 ⇒ 弃/入/入/入/入/弃；每一次都统计
     ``execute_leg`` 调用数（带外必须为 0 ⇒ 零降级），并在三套不同的 cfg 窗口下重复（结果不变）。
     """
     cfg_bands = [
         CFG,                                                        # 端口默认 0.48/0.90
-        {"strategy": {"yes_min_ask": "0.45", "yes_max_ask": "0.75"}},  # 部署配置
+        {"strategy": {"yes_min_ask": "0.45", "yes_max_ask": "0.81"}},  # 部署配置
         {"yes_min_ask": "0.10", "yes_max_ask": "0.99"},              # 极端放宽
     ]
-    probes = [("0.199", False), ("0.200", False), ("0.201", True),
+    probes = [("0.269", False), ("0.270", True), ("0.271", True),
               ("0.319", True), ("0.320", True), ("0.321", False)]
-    print("  [live next-entry leg window] leg floor/cap = 0.20/0.32 (own window; cfg band ignored)")
+    print("  [live next-entry leg window] leg floor/cap = 0.27/0.32 (own window; cfg band ignored)")
     for cfg in cfg_bands:
         for raw, want in probes:
             got, t = _run(_next_leg(raw), fire=_next_fire(raw), cfg=cfg, book=NEXT_BOOK,
@@ -1916,12 +1919,12 @@ def test_live_taker_next_entry_leg_window_gate():
                 assert not [c for c in calls if c.get("post_only") is True], (cfg, raw, t.calls)
             assert not [c for c in calls if c.get("post_only") is True], (cfg, raw, t.calls)
 
-    # 改腿窗口 ⇒ 该腿判定随之变化（窗口是腿自有的）
-    for raw, want in (("0.249", False), ("0.251", True), ("0.299", True), ("0.301", False)):
+    # 改腿窗口 ⇒ 该腿判定随之变化（窗口是腿自有的，闭区间）
+    for raw, want in (("0.249", False), ("0.250", True), ("0.251", True), ("0.299", True), ("0.300", True), ("0.301", False)):
         got, t = _run(_next_leg(raw, floor="0.25", cap="0.30"), fire=_next_fire(raw), cfg=CFG,
                       book=NEXT_BOOK, limit="0.30")
         assert got["order_mode"] == ("taker" if want else "skip"), (raw, got)
-        assert got["leg_window"] == "(0.25, 0.30]", (raw, got)
+        assert got["leg_window"] == "[0.25, 0.30]", (raw, got)
         assert len(_sent(t)) == (1 if want else 0), (raw, t.calls)
 
     # 既有目标桶腿（无 entry_channel）继续按 cfg 窗口判定，且不受本次改动影响
@@ -1944,12 +1947,12 @@ def test_live_taker_next_entry_leg_window_gate():
         assert got["status"] == "leg_window_unusable", (cap, floor, got)
         assert got["order_mode"] == "skip" and _sent(t) == [], (cap, floor, t.calls)
         assert got["filled_shares"] == ZERO and got["fill_and_kill"] is False, got
-    # 只缺 floor（或 floor=0）⇒ 视为无下界 (0, cap]，仍是腿自带窗口而不是 cfg 窗口
-    win_missing_floor = port_mod.leg_take_window(_next_leg("0.25", floor="0"), _next_fire("0.25"),
+    # 只缺 floor（或 floor=0）⇒ 视为无下界 [0, cap]，仍是腿自带窗口而不是 cfg 窗口
+    win_missing_floor = port_mod.leg_take_window(_next_leg("0.28", floor="0"), _next_fire("0.28"),
                                                  target_band)
     assert win_missing_floor["ok"] and win_missing_floor["lo"] == ZERO \
         and win_missing_floor["hi"] == Decimal("0.32"), win_missing_floor
-    got, t = _run(_next_leg("0.25", floor="0"), fire=_next_fire("0.25"), cfg=target_band,
+    got, t = _run(_next_leg("0.28", floor="0"), fire=_next_fire("0.28"), cfg=target_band,
                   book=NEXT_BOOK, limit="0.30")
     assert got["order_mode"] == "taker", got
     got, t = _run(_next_leg("0.60", floor=""), fire=_next_fire("0.60"), cfg=target_band,
@@ -1960,10 +1963,10 @@ def test_live_taker_next_entry_leg_window_gate():
 def test_live_taker_next_entry_channel_audit_not_spoofable():
     """审计可区分通道（entry_channel / leg_window / next_entry_window）且**不可被 audit_extra 伪造**。"""
     # (a) 端口层：腿里塞一个 AuditExtra 伪造块，端口只用自己从腿推导的权威值
-    spoof = {"entry_channel": "target_bucket", "leg_window": "(0.45, 0.75]", "taker_gate_ok": False}
-    leg = _next_leg("0.25")
+    spoof = {"entry_channel": "target_bucket", "leg_window": "(0.45, 0.81]", "taker_gate_ok": False}
+    leg = _next_leg("0.28")
     leg["audit_extra"] = dict(spoof)
-    got, t = _run(leg, fire=_next_fire("0.25"), cfg=CFG, book=NEXT_BOOK, limit="0.30")
+    got, t = _run(leg, fire=_next_fire("0.28"), cfg=CFG, book=NEXT_BOOK, limit="0.30")
     call = _sent(t)[0]
     assert call["leg_channel"] == "next_bucket" and call["leg_window"] == NEXT_WINDOW, call
     assert call["audit_extra"]["entry_channel"] == "next_bucket", call["audit_extra"]
@@ -2003,6 +2006,39 @@ def test_live_taker_next_entry_channel_audit_not_spoofable():
     assert described["entry_channels"] == ["target_bucket", "next_bucket"], described
     assert described["passive_fallback"] is False, described
     assert "buy_yes_next" in described["yes_legs"], described
+    assert described["local_refusals"] == ["below_min_order_size", "ask_below_floor"], described
+
+
+def test_live_next_entry_ask_below_floor_deny_audit():
+    """next_bucket ask below floor refuses with ask_below_floor and writes deny audit row."""
+    with tempfile.TemporaryDirectory() as tmp, _stub_v2_lib():
+        log = Path(tmp) / "audit.jsonl"
+        port = _live_port(_StubTransport(), account=ACCOUNT_OK, preflight=True, audit_path=log)
+        leg = _next_leg("0.20", floor="0.27", cap="0.32")
+        fire = _next_fire("0.20")
+        got = port.match(leg=leg, book=NEXT_BOOK, limit=Decimal("0.30"), shares=Decimal("10"), fire=fire, cfg=CFG)
+        assert got["order_mode"] == "skip"
+        assert got["status"] == "ask_below_floor"
+        lines = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert len(lines) == 1, lines
+        assert lines[0]["action"] == "deny"
+        assert lines[0]["reason"] == "ask_below_floor"
+        assert lines[0]["params"]["ask"] == "0.20"
+        assert lines[0]["params"]["floor"] == "0.27"
+        assert lines[0]["params"]["entry_channel"] == "next_bucket"
+        assert lines[0]["params"]["window_source"] == "leg_window"
+
+
+def test_live_taker_shares_hard_cap():
+    """match clamps shares <= budget / min_ask."""
+    with _stub_v2_lib():
+        stub = _StubTransport()
+        port = _live_port(stub, account=ACCOUNT_OK, preflight=True)
+        leg = _next_leg("0.28", floor="0.27", cap="0.32")
+        fire = _next_fire("0.28", budget_usdc="5.40")  # 5.40 / 0.27 = 20 max shares
+        port.match(leg=leg, book=NEXT_BOOK, limit=Decimal("0.30"), shares=Decimal("100"), fire=fire, cfg=CFG)
+        assert len(stub.calls) == 1
+        assert stub.calls[0]["size"] == Decimal("20")
 
 
 def test_v2_transport_unforgeable_audit_keys():

@@ -499,6 +499,36 @@ def cancel_with_retry(client, order_id: str, *, attempts: int = 3, sleep=None, a
     return result
 
 
+def fill_trades(client, order_id: str, *, token_id: str | None = None) -> list[dict]:
+    """Trades belonging to this order, matching across taker/maker/order ID fields (read-only; best effort)."""
+    try:
+        rows = client.get_trades() or []
+    except Exception:  # noqa: BLE001 - the trades are informative, not load-bearing
+        return []
+    oid = str(order_id)
+    matched = []
+    for row in rows:
+        row_oid = _field(row, "taker_order_id", "takerOrderId", "maker_order_id", "makerOrderId",
+                         "orderID", "order_id", "id")
+        if row_oid is not None and str(row_oid) == oid:
+            if token_id is not None:
+                row_tok = _field(row, "asset_id", "token_id", "tokenId")
+                if row_tok is not None and str(row_tok) != str(token_id):
+                    continue
+            matched.append(row)
+    return matched
+
+
+def _fill_cost(*, filled_shares: Decimal, avg_price: Decimal | None = None,
+               notional: Decimal | None = None) -> Decimal:
+    """Calculate actual executed notional/cost, preferring exact trade notional over shares * price."""
+    if notional is not None and notional > ZERO:
+        return notional.quantize(QTY)
+    if avg_price is not None and avg_price > ZERO and filled_shares > ZERO:
+        return (filled_shares * avg_price).quantize(QTY)
+    return ZERO
+
+
 def poll_fill(client, order_id: str, *, attempts: int = 6, sleep=None, sleep_seconds: float = 1.0,
               trades: bool = True) -> dict:
     """Poll ``get_order`` (and ``get_trades``) until terminal or timeout; report the real fill."""
@@ -510,7 +540,8 @@ def poll_fill(client, order_id: str, *, attempts: int = 6, sleep=None, sleep_sec
         except Exception as exc:  # noqa: BLE001 - a read failure is not a fill
             return {"ok": False, "status": "poll_error", "attempts": attempt,
                     "detail": f"{type(exc).__name__}: {exc}", "last": last,
-                    "filled_shares": ZERO, "avg_price": None, "unfilled": None, "terminal": False}
+                    "filled_shares": ZERO, "avg_price": None, "cost": ZERO,
+                    "unfilled": None, "terminal": False}
         last = order_summary(order)
         status = str(last.get("status") or "").lower()
         matched = _dec(_field(order, "size_matched") or 0, "size_matched")
@@ -518,36 +549,39 @@ def poll_fill(client, order_id: str, *, attempts: int = 6, sleep=None, sleep_sec
         if status in TERMINAL_STATUSES or (status in RESTING_STATUSES and matched > 0 and matched == original):
             price = _field(order, "price")
             avg = None
+            notional = None
             if trades:
-                avg = average_fill_price(client, str(order_id), token_id=_field(order, "asset_id"))
+                tr_list = fill_trades(client, str(order_id), token_id=_field(order, "asset_id"))
+                if tr_list:
+                    tr_shares = sum((_dec(_field(r, "size") or 0, "size") for r in tr_list), ZERO)
+                    tr_cost = sum((_dec(_field(r, "size") or 0, "size") * _dec(_field(r, "price") or 0, "price") for r in tr_list), ZERO)
+                    if tr_shares > ZERO:
+                        avg = (tr_cost / tr_shares).quantize(QTY)
+                        notional = tr_cost.quantize(QTY)
             if avg is None and price is not None:
                 avg = Decimal(str(price))
             filled = matched
+            cost = _fill_cost(filled_shares=filled, avg_price=avg, notional=notional)
             return {"ok": True, "status": status, "attempts": attempt, "terminal": True,
-                    "filled_shares": filled, "avg_price": avg,
+                    "filled_shares": filled, "avg_price": avg, "cost": cost,
                     "unfilled": max(original - filled, ZERO), "last": last}
         if sleep_seconds:
             sleep(sleep_seconds)
     status = str((last or {}).get("status") or "").lower()
     matched = _dec((last or {}).get("size_matched") or 0, "size_matched")
     return {"ok": False, "status": "timeout", "attempts": attempts, "terminal": False,
-            "filled_shares": matched, "avg_price": None, "unfilled": None, "last": last,
+            "filled_shares": matched, "avg_price": None, "cost": ZERO, "unfilled": None, "last": last,
             "detail": f"order still {status or 'unknown'} after {attempts} poll(s)"}
 
 
 def average_fill_price(client, order_id: str, *, token_id: str | None = None) -> Decimal | None:
     """Weighted average of the trades belonging to this order (read-only; best effort)."""
-    try:
-        rows = client.get_trades() or []
-    except Exception:  # noqa: BLE001 - the average is informative, not load-bearing
+    trades = fill_trades(client, order_id, token_id=token_id)
+    if not trades:
         return None
     shares = ZERO
     cost = ZERO
-    for row in rows:
-        if _field(row, "orderID", "order_id", "id") not in (order_id, None):
-            continue
-        if _field(row, "orderID", "order_id") is None:
-            continue
+    for row in trades:
         size = _dec(_field(row, "size") or 0, "size")
         price = _dec(_field(row, "price") or 0, "price")
         shares += size
@@ -898,7 +932,9 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
     fill = poll_fill(client, order_id, attempts=poll_attempts, sleep=sleep, sleep_seconds=poll_sleep)
     filled = fill.get("filled_shares") or ZERO
     avg = fill.get("avg_price")
-    cost = (filled * avg).quantize(QTY) if (filled > ZERO and avg is not None) else ZERO
+    cost = fill.get("cost")
+    if cost is None:
+        cost = _fill_cost(filled_shares=filled, avg_price=avg)
     result = {**out, "ok": True, "order_id": order_id, "status": fill["status"],
               "filled_shares": filled, "avg_price": avg, "cost": cost,
               "unfilled": (shares - filled) if filled <= shares else ZERO,

@@ -85,7 +85,7 @@ DEFAULT_CONFIG = {
     # 执行模式: "capped_taker" (推荐) 或 "best_bid_peg"
     "entry_mode": "capped_taker",
     "yes_min_ask": Decimal("0.45"),                   # YES 必须确认一定胜率 (>0.45)
-    "yes_max_ask": Decimal("0.75"),                   # YES 安全入场顶价，与 live 端口 taker 带门统一为 0.75，绝不追高 (>0.75 放弃)
+    "yes_max_ask": Decimal("0.81"),                   # YES 安全入场顶价，与 live 端口 taker 带门统一为 0.81，绝不追高 (>0.81 放弃)
     #: ⚠ 已废弃（DEPRECATED, F-A 2026-09-12）：旧 sizing 基数，**不再**是权威值。
     #: 唯一基数 = 生效 fire 预算（引擎注入的 ``fire_budget_usdc``，见 ``order_budget()``）；
     #: 本键只在 ``fire_budget_usdc`` 缺失时作为兼容回退（缺省 15.0），保留仅为不破坏旧调用方。
@@ -96,6 +96,9 @@ DEFAULT_CONFIG = {
     "early_stop_enabled": True,
     "early_stop_next_bucket_surge": Decimal("0.35"),  # 下一档暴涨至 0.35 触发抢跑止损
     "early_stop_bid_floor": Decimal("0.45"),          # 当前持仓 YES 盘口跌破 0.45 触发抢跑止损
+    "next_bucket_stop_loss_pct": Decimal("0.50"),     # 下一档通道相对入场价止损比例
+    "next_bucket_bid_floor": Decimal("0.12"),         # 下一档通道止损绝对保底门限
+    "early_stop_grace_seconds": 1200,                 # 下一档通道持仓冷却冷静期（秒）
     # 破位与追火约束
     "max_fires_per_session": 2,                       # 单日同一标的最多 2 次 (初次 + 1次追火，止损后熔断阻断)
     "risk_control_no_cap": Decimal("0.85"),           # 破位 NO 腿超过 0.85 坚决不买 (防扫空)
@@ -104,8 +107,8 @@ DEFAULT_CONFIG = {
     # 下一档桶廉价入场 (buy_yes_next)：入场对象 = 当前预期极值桶的"上一档"桶，价格窗口自有独立。
     # 代码默认**关闭**（EV 前提未经结算验证）；本次部署由 config/yes2re_reversal.json 显式开启。
     "next_entry_enabled": False,
-    "next_entry_min_ask": Decimal("0.20"),            # 窗口下界（半开：0.20 本身不含 ⇒ 弃单）
-    "next_entry_max_ask": Decimal("0.32"),            # 窗口上界（半开：0.32 本身含 ⇒ 入场）
+    "next_entry_min_ask": Decimal("0.27"),            # 窗口下界（闭区间：0.27 本身含 ⇒ 入场）
+    "next_entry_max_ask": Decimal("0.32"),            # 窗口上界（闭区间：0.32 本身含 ⇒ 入场）
     "next_entry_budget_pct": Decimal("0.5"),          # 通道预算 = fire 预算 × 0.5（与既有通道隔离）
 }
 
@@ -138,11 +141,10 @@ def _dec_or_none(val: Any) -> Decimal | None:
 
 
 def parse_next_entry_window(cfg: dict[str, Any] | None) -> dict[str, Any]:
-    """解析并行通道"下一档桶廉价入场"的**自有**价格窗口 ``(next_entry_min_ask, next_entry_max_ask]``。
+    """解析并行通道"下一档桶廉价入场"的**自有**价格窗口 ``[next_entry_min_ask, next_entry_max_ask]``。
 
-    半开区间：下界**不含**（ask == lo ⇒ 弃单）、上界**含**（ask == hi ⇒ 入场），与既有通道
-    ``(yes_min_ask, yes_max_ask]`` 同一约定。任何不可用配置（缺失/不可解析/负数/上界 > 1/
-    ``lo >= hi``）一律返回 ``ok=False`` ⇒ 调用方**整通道弃单**，绝不回退既有窗口、绝不降级挂单。
+    闭区间：下界**含**（ask == lo ⇒ 入场）、上界**含**（ask == hi ⇒ 入场）。
+    任何不可用配置（缺失/不可解析/负数/上界 > 1/``lo >= hi``）一律返回 ``ok=False`` ⇒ 调用方**整通道弃单**，绝不回退既有窗口、绝不降级挂单。
     纯函数：只读 ``cfg``。
     """
     src = cfg if isinstance(cfg, dict) else {}
@@ -154,8 +156,8 @@ def parse_next_entry_window(cfg: dict[str, Any] | None) -> dict[str, Any]:
         return {"ok": False, "lo": None, "hi": None, "label": None,
                 "detail": (f"next-entry window unusable (next_entry_min_ask={lo_raw!r}, "
                            f"next_entry_max_ask={hi_raw!r}) — 整通道弃单（不回退既有窗口）")}
-    return {"ok": True, "lo": lo, "hi": hi, "label": f"({lo}, {hi}]",
-            "detail": f"({lo}, {hi}] (half-open: {lo} excluded, {hi} included)"}
+    return {"ok": True, "lo": lo, "hi": hi, "label": f"[{lo}, {hi}]",
+            "detail": f"[{lo}, {hi}] (closed: {lo} included, {hi} included)"}
 
 
 def bucket_contains(bucket: dict[str, Any], val: float) -> bool:
@@ -262,6 +264,7 @@ class PositionRecord:
     liquidation_type: str = ""   # EARLY_STOP_SURGE, EARLY_STOP_BID_FLOOR, METAR_BREACH
     recovered_usdc: Decimal = ZERO
     realized_pnl_usdc: Decimal = ZERO
+    entry_channel: str = ""
 
 
 @dataclass
@@ -275,6 +278,7 @@ class ConsensusLockState:
     #: 预算隔离（加法式）：新通道在每个会话已占用的名义额度（USDC）。
     #: 既有目标桶通道只用 ``fire 预算 − 这里的占用`` ⇒ 两通道永不重复花同一笔钱。
     session_next_entry_used: dict[str, Decimal] = field(default_factory=dict)
+    suppressed_early_stops: set[str] = field(default_factory=set)
 
 
 class ConsensusLockStrategy:
@@ -501,10 +505,10 @@ class ConsensusLockStrategy:
         if next_ask is None:
             return {"action": "skip", "reason": "next_entry_no_active_ask",
                     "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
-        # 半开窗口：lo 不含、hi 含。区间外 ⇒ 彻底弃单（绝不降级/绝不挂被动单）。
-        if next_ask <= win["lo"]:
+        # 闭区间窗口：lo 含、hi 含。区间外 ⇒ 彻底弃单（绝不降级/绝不挂被动单）。
+        if next_ask < win["lo"]:
             return {"action": "skip",
-                    "reason": (f"next_entry_ask_below_window ({next_ask} <= {win['lo']}; "
+                    "reason": (f"next_entry_ask_below_window ({next_ask} < {win['lo']}; "
                                f"window {win['label']})"),
                     "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
         if next_ask > win["hi"]:
@@ -523,6 +527,10 @@ class ConsensusLockStrategy:
         # 仍是 ``基数 × pct`` 并按 0.01 取整；只是基数不再可能与引擎发的钱不一致。
         budget = (self.order_budget() * pct).quantize(Decimal("0.01"))
         shares = (budget / next_ask).to_integral_value(rounding=ROUND_DOWN)
+        # FAK share hard-cap: 严格受限于 budget / min_ask
+        max_allowed_shares = (budget / win["lo"]).to_integral_value(rounding=ROUND_DOWN)
+        if shares > max_allowed_shares:
+            shares = max_allowed_shares
         if shares <= ZERO:
             return {"action": "skip", "reason": "next_entry_zero_shares_calculated",
                     "key": key, "meta": meta_cons, "entry_channel": CHANNEL_NEXT}
@@ -538,6 +546,7 @@ class ConsensusLockStrategy:
             avg_price=next_ask,
             entry_ts_utc=now_utc.isoformat(),
             liquidated=False,
+            entry_channel=CHANNEL_NEXT,
         )
         self.state.open_positions[key] = pos
         self.state.locked_sessions[key] = {
@@ -717,10 +726,10 @@ class ConsensusLockStrategy:
         # 无 fire_budget_usdc 时回退旧键 order_budget_usdc（缺省 15.0）⇒ 旧调用方/旧用例逐字不变。
         budget = self.order_budget()
         min_ask = _dec(self.cfg["yes_min_ask"], "0.45")
-        max_ask = _dec(self.cfg["yes_max_ask"], "0.75")
+        max_ask = _dec(self.cfg["yes_max_ask"], "0.81")
 
         if entry_mode == "capped_taker":
-            # 模式 A: Capped Taker (主动吃单，带顶价 0.75，不错失高胜率确定性机会)
+            # 模式 A: Capped Taker (主动吃单，带顶价 0.81，不错失高胜率确定性机会)
             if ask < min_ask:
                 return {"action": "skip", "reason": f"ask_below_confirmation_floor ({ask} < {min_ask})", "key": key}
             if ask > max_ask:
@@ -741,6 +750,7 @@ class ConsensusLockStrategy:
                 avg_price=ask,
                 entry_ts_utc=now_utc.isoformat(),
                 liquidated=False,
+                entry_channel=CHANNEL_TARGET,
             )
             self.state.open_positions[key] = pos
             self.state.locked_sessions[key] = {
@@ -852,19 +862,61 @@ class ConsensusLockStrategy:
         book_curr = books_by_token.get(pos.yes_token_id)
         bid_curr = get_best_bid(book_curr) or ZERO
 
-        # 条件 B: 持仓买盘跌破防线 (e.g. 0.45)
-        floor_bid = _dec(self.cfg["early_stop_bid_floor"], "0.45")
-        if bid_curr < floor_bid and bid_curr > ZERO:
-            trigger_reason = f"bid_floor_broken (bid={bid_curr} < {floor_bid})"
-
-        # 条件 A: 下一档暴涨 (e.g. 0.35)
-        if not trigger_reason and next_b:
+        # 条件 A: 下一档暴涨 (e.g. 0.35) — 评估在先，且不受 cooldown 抑制
+        if next_b:
             next_yes_tok = next_b.get("yes_token_id") or next_b.get("_yes_token_id")
             book_next = books_by_token.get(str(next_yes_tok)) if next_yes_tok else None
             ask_next = get_best_ask(book_next)
-            surge_thresh = _dec(self.cfg["early_stop_next_bucket_surge"], "0.35")
+            surge_thresh = _dec(self.cfg.get("early_stop_next_bucket_surge", "0.35"), "0.35")
             if ask_next is not None and ask_next >= surge_thresh:
                 trigger_reason = f"next_bucket_surge (next_ask={ask_next} >= {surge_thresh})"
+
+        # 条件 B: 持仓买盘跌破防线 (两通道独立门限与冷却期解耦)
+        entry_channel = (getattr(pos, "entry_channel", "")
+                         or self.state.locked_sessions.get(session_key, {}).get("entry_channel", "")
+                         or CHANNEL_TARGET)
+
+        if not trigger_reason:
+            if entry_channel == CHANNEL_NEXT:
+                stop_loss_pct = _dec(self.cfg.get("next_bucket_stop_loss_pct", "0.50"), "0.50")
+                bid_floor_min = _dec(self.cfg.get("next_bucket_bid_floor", "0.12"), "0.12")
+                floor_bid = max((pos.avg_price * stop_loss_pct).quantize(Decimal("0.0001")), bid_floor_min)
+                b_reason = f"bid_floor_broken (chan=next_bucket, bid={bid_curr} < floor {floor_bid} = entry {pos.avg_price} x {stop_loss_pct})"
+            else:
+                floor_bid = _dec(self.cfg.get("early_stop_bid_floor", "0.45"), "0.45")
+                b_reason = f"bid_floor_broken (bid={bid_curr} < {floor_bid})"
+
+            if bid_curr < floor_bid and bid_curr > ZERO:
+                # 冷却期抑制判断（针对下一档廉价通道，持仓入场后的冷静期不盲目止损）
+                if entry_channel == CHANNEL_NEXT:
+                    grace_seconds = int(self.cfg.get("early_stop_grace_seconds", 1200))
+                    elapsed = None
+                    if pos.entry_ts_utc:
+                        try:
+                            entry_dt = datetime.fromisoformat(pos.entry_ts_utc.replace("Z", "+00:00"))
+                            if entry_dt.tzinfo is None:
+                                entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                            elapsed = (now_utc - entry_dt).total_seconds()
+                        except Exception:
+                            pass
+                    if elapsed is not None and elapsed < grace_seconds:
+                        rem = max(0.0, round(grace_seconds - elapsed, 2))
+                        duplicate = session_key in self.state.suppressed_early_stops
+                        if not duplicate:
+                            self.state.suppressed_early_stops.add(session_key)
+                        return {
+                            "action": "early_stop_suppressed",
+                            "reason": b_reason,
+                            "bid": str(bid_curr),
+                            "floor": str(floor_bid),
+                            "grace_seconds": grace_seconds,
+                            "remaining_grace_seconds": rem,
+                            "duplicate": duplicate,
+                            "entry_channel": entry_channel,
+                            "session_key": session_key,
+                            "at_utc": now_utc.isoformat(),
+                        }
+                trigger_reason = b_reason
 
         if not trigger_reason:
             return None

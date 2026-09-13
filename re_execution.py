@@ -66,20 +66,22 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
     # Ladder: 0ms flat, 1500ms +1 tick, 4000ms still at +1 (cap-bounded)
     floor_raw = leg.get("floor")
     floor = _dec(floor_raw) if floor_raw not in (None, "") else None
-    if floor is not None and ask <= floor:
-        # Breakout not confirmed on this rung (ask still under the floor):
-        # skip, do not fill — later rungs retry; if price never enters the
-        # (floor, cap] window the leg simply ends unfilled.
-        return {
-            "status": "below_floor",
-            "leg": leg.get("leg"),
-            "token_id": token,
-            "best_ask": str(ask),
-            "floor": str(floor),
-            "cap": str(cap),
-            "elapsed_ms": elapsed_ms,
-            "note": "breakout_not_confirmed_skip_rung",
-        }
+    if floor is not None:
+        is_below = (ask < floor) if leg.get("entry_channel") == "next_bucket" else (ask <= floor)
+        if is_below:
+            # Breakout not confirmed on this rung (ask still under the floor):
+            # skip, do not fill — later rungs retry; if price never enters the
+            # window the leg simply ends unfilled.
+            return {
+                "status": "below_floor",
+                "leg": leg.get("leg"),
+                "token_id": token,
+                "best_ask": str(ask),
+                "floor": str(floor),
+                "cap": str(cap),
+                "elapsed_ms": elapsed_ms,
+                "note": "breakout_not_confirmed_skip_rung",
+            }
     extra = 0
     if elapsed_ms >= LADDER_MS[1]:
         extra = 1
@@ -143,7 +145,14 @@ def size_legs(fire_event, budget_usdc):
     for leg in fire_event.get("legs") or []:
         pct = _dec(leg.get("notional_pct"), "0")
         cap = _dec(leg.get("cap"), "0.50")
-        out[str(leg.get("leg"))] = shares_from_notional((budget_usdc * pct).quantize(Decimal("0.01")), cap)
+        leg_budget = (budget_usdc * pct).quantize(Decimal("0.01"))
+        shares = shares_from_notional(leg_budget, cap)
+        floor = _dec(leg.get("floor"), "0")
+        if floor > ZERO:
+            max_allowed = (leg_budget / floor).to_integral_value(rounding=ROUND_DOWN)
+            if shares > max_allowed:
+                shares = max_allowed
+        out[str(leg.get("leg"))] = shares
     return out
 
 def paper_match_fak(book, limit, shares):
