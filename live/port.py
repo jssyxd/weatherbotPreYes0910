@@ -89,7 +89,7 @@ bucket that is going to zero (observed on 2026-09-11: Toronto YES → 0.001, War
 from __future__ import annotations
 
 import sys
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 

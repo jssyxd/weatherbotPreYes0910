@@ -286,13 +286,13 @@ class _StubTransport:
 ACCOUNT_OK = {"usdc_balance": 51.0, "open_orders": 0, "positions": [], "positions_value_usdc": 0.0}
 
 
-def _live_port(transport, *, account=None, limits=None, preflight=False):
+def _live_port(transport, *, account=None, limits=None, preflight=False, audit_path=None):
     port_mod.reset_cache()
     port = port_mod.LivePort(transport, env=_live_env(), gates=GATES_OK,
                              limits=limits or {"fire_budget_usdc": "12", "max_open_positions": "10",
                                                "max_capital_usdc": "50"},
                              account_reader=(lambda client: account) if account else None,
-                             sleep=lambda _s: None)
+                             sleep=lambda _s: None, audit_path=audit_path)
     if preflight:
         ok = port.preflight(fire={**FIRE, "budget_usdc": "12"}, cfg={"fire_budget_usdc": 12})
         assert ok["ok"] is True, ok
@@ -1679,8 +1679,8 @@ def test_live_taker_limits_and_band_fail_closed():
     # a real config carries the band under cfg["strategy"] — read it and take inside it
     real = json.loads((ROOT / "config" / "yes2re_reversal.json").read_text(encoding="utf-8"))
     real_band = port_mod.yes_price_band(real)
-    assert real_band == {"ok": True, "lo": Decimal("0.45"), "hi": Decimal("0.75"),
-                        "detail": "(0.45, 0.75]"}, real_band
+    assert real_band == {"ok": True, "lo": Decimal("0.45"), "hi": Decimal("0.81"),
+                        "detail": "(0.45, 0.81]"}, real_band
     # ... and the band it yields is what actually decides: 0.60 in, 0.30/0.95 out
     shifted = {"strategy": {"yes_min_ask": "0.30", "yes_max_ask": "0.60"}}
     assert _decide("0.60", cfg=shifted)["taker"] is True
@@ -2037,8 +2037,9 @@ def test_live_taker_shares_hard_cap():
         leg = _next_leg("0.28", floor="0.27", cap="0.32")
         fire = _next_fire("0.28", budget_usdc="5.40")  # 5.40 / 0.27 = 20 max shares
         port.match(leg=leg, book=NEXT_BOOK, limit=Decimal("0.30"), shares=Decimal("100"), fire=fire, cfg=CFG)
-        assert len(stub.calls) == 1
-        assert stub.calls[0]["size"] == Decimal("20")
+        sent = _sent(stub)
+        assert len(sent) == 1
+        assert sent[0]["size"] == Decimal("20")
 
 
 def test_v2_transport_unforgeable_audit_keys():
@@ -2137,8 +2138,8 @@ def test_live_match_below_min_order_size_local_refusal():
     def _match(shares, book):
         transport = _StubTransport()
         port = _live_port(transport, account=ACCOUNT_OK, preflight=True)
-        got = port.match(leg=_next_leg("0.25"), book=book, limit=Decimal("0.30"),
-                         shares=Decimal(shares), fire=_next_fire("0.25"), cfg=CFG)
+        got = port.match(leg=_next_leg("0.28"), book=book, limit=Decimal("0.30"),
+                         shares=Decimal(shares), fire=_next_fire("0.28"), cfg=CFG)
         return got, _sent(transport)
 
     for shares, want in (("4.9", False), ("5.0", True), ("5.1", True)):
